@@ -1,0 +1,35 @@
+# DSH Vault
+/target
+**/target
+**/gen/schemas
+node_modules
+
+# test artifacts & logs
+*.log
+*.png
+*-result.json
+scan-result*.json
+final-scan*.json
+lock-*.json
+progress-*.json
+verify-*.json
+export-*.json
+import-*.json
+incremental-*.json
+rollback-*.json
+transaction-*.json
+backup-00*-result.json
+restore-result.json
+old-compatible-verify.json
+final-test.txt
+design-detect.json
+cargo-errors.txt
+
+# one-off patch / e2e scripts
+_patch_*.py
+e2e-*.py
+_proto-verify.mjs
+dsh-vault-core.mjs
+dsh-vault.mjs
+_search_sessions.py
+dsh-vault.cmd

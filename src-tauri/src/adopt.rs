@@ -1,0 +1,1232 @@
+//! 环境接管（adopt）：把 DSH Home 的关键子目录移入仓库，原位置留目录级 symlink。
+//!
+//! 设计来源：GNU Stow --adopt + winstow 相对路径 symlink，经 REVIEW-FINDINGS.md 修正：
+//! - 只接管小目录（sessions/skills/...），不接管 profiles/（827MB 可重建）；
+//! - symlink 链接到目录级（DSH 需要在其下新建 project_dir/session_dir）；
+//! - 同盘符用相对路径保证便携性，跨盘符必须用绝对路径（Windows 限制）；
+//! - 接管前必须检测 DSH 进程，运行中则拒绝并提示用户先关闭。
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// 接管的子目录（只接管这些小而重要的目录）。
+pub const ADOPT_DIRS: &[&str] = &[
+    "sessions",
+    "skills",
+    ".agent-presets",
+    "guard",
+    "rollbacks",
+    "storages",
+    "undo-snapshots",
+    "memories", // AIO 特有
+    "team",     // AIO 特有
+];
+
+/// profiles/ 不整体接管，只备份这些声明文件。
+pub const PROFILE_DECL_FILES: &[&str] = &[
+    "package.json",
+    "cordis.patch.yml",
+    "cordis.yml",
+    "pnpm-workspace.yaml",
+    ".dsh-builtin-plugins.json",
+    ".dsh-profile-compatibility.json",
+];
+
+/// 仓库内的接管标记文件名。
+pub const ADOPT_MARK: &str = ".dshvault";
+
+/// 进度回调：报告 (done, total, current)。
+pub type ProgressFn<'a> = Option<&'a dyn Fn(u64, u64, &str)>;
+
+fn emit_progress(cb: ProgressFn, done: u64, total: u64, current: &str) {
+    if let Some(f) = cb {
+        f(done, total, current);
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptResult {
+    pub home_id: String,
+    pub moved_dirs: Vec<String>,
+    pub created_links: Vec<String>,
+    pub profile_decl_files: u32,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnadoptResult {
+    pub home_id: String,
+    pub restored_dirs: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkMapping {
+    pub rel: String,        // 相对于 home 的子路径，如 "sessions"
+    pub target: String,     // symlink 实际指向（相对或绝对）
+    pub absolute: bool,
+}
+
+/// 接管清单：记录一个 home 被接管后的全部 symlink 映射。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptRecord {
+    pub version: u32,
+    pub home_id: String,
+    pub home_path: String,
+    pub note: String,
+    pub adopted_at: String,
+    pub links: Vec<LinkMapping>,
+    /// 接管时的文件清单（rel → sha256），用于变更检测。version >= 2 才有。
+    #[serde(default)]
+    pub manifest: std::collections::HashMap<String, String>,
+}
+
+fn now_string() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+fn home_id_of(path: &Path) -> String {
+    let normalized = path.to_string_lossy().to_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("root-{}", &digest[..12])
+}
+
+/// 检测 DSH 是否在运行（Windows ToolHelp32 进程快照）。
+/// 返回运行中的 DSH 进程名列表（空 = 未运行）。
+#[cfg(windows)]
+pub fn detect_dsh_processes() -> Vec<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let mut found = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return found;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut has = Process32FirstW(snap, &mut entry);
+        while has != 0 {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            let name = OsString::from_wide(&entry.szExeFile[..len]).to_string_lossy().to_lowercase();
+            // DSH 官方/EAC/AIO 进程名特征：dsh、deepseek、harness
+            let is_dsh = (name.contains("dsh") || name.contains("deepseek") || name.contains("harness"))
+                && name.ends_with(".exe")
+                && !name.contains("dsh-vault") // 排除本工具自身
+                && !name.contains("dsh_vault"); // 排除本工具的测试二进制（下划线）
+            if is_dsh {
+                found.push(name);
+            }
+            has = Process32NextW(snap, &mut entry);
+        }
+        CloseHandle(snap);
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+#[cfg(not(windows))]
+pub fn detect_dsh_processes() -> Vec<String> {
+    Vec::new()
+}
+
+/// 判断 symlink 目标该用相对还是绝对路径。
+/// Windows 限制：跨盘符没有相对路径，必须用绝对路径。
+fn same_volume(a: &Path, b: &Path) -> bool {
+    let pa = a.components().next();
+    let pb = b.components().next();
+    match (pa, pb) {
+        (Some(std::path::Component::Prefix(x)), Some(std::path::Component::Prefix(y))) => {
+            x.as_os_str().to_string_lossy().to_lowercase() == y.as_os_str().to_string_lossy().to_lowercase()
+        }
+        _ => false,
+    }
+}
+
+/// 计算从 from_dir 到 target 的相对路径（仅同盘符调用）。
+fn relative_path(from_dir: &Path, target: &Path) -> Option<PathBuf> {
+    let from: Vec<_> = from_dir.components().collect();
+    let to: Vec<_> = target.components().collect();
+    let mut i = 0;
+    while i < from.len() && i < to.len() && from[i] == to[i] {
+        i += 1;
+    }
+    let mut rel = PathBuf::new();
+    for _ in i..from.len() {
+        rel.push("..");
+    }
+    for c in &to[i..] {
+        rel.push(c.as_os_str());
+    }
+    Some(rel)
+}
+
+/// 创建目录级 symlink，优先相对路径（同盘符），失败报错提示开开发者模式。
+pub fn create_dir_link(link: &Path, target: &Path) -> Result<String, String> {
+    if link.exists() || link.symlink_metadata().is_ok() {
+        return Err(format!("链接位置已存在：{}", link.display()));
+    }
+    let (final_target, _absolute) = if same_volume(link, target) {
+        let parent = link.parent().ok_or_else(|| "无法获取链接父目录".to_string())?;
+        match relative_path(parent, target) {
+            Some(rel) => (rel, false),
+            None => (target.to_path_buf(), true),
+        }
+    } else {
+        (target.to_path_buf(), true)
+    };
+
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(&final_target, link).map_err(|e| {
+            format!(
+                "创建链接失败：{e}。请以开发者模式运行 Windows（设置→系统→开发者选项→开发者模式），或以管理员身份运行本工具。"
+            )
+        })?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(&final_target, link).map_err(|e| format!("创建链接失败：{e}"))?;
+    }
+    Ok(final_target.to_string_lossy().to_string())
+}
+
+/// 通过 Tauri 发送 op-progress 事件（无 app 时静默）。
+pub fn emit_op_progress(app: Option<&tauri::AppHandle>, done: u64, total: u64, current: &str) {
+    use tauri::Emitter;
+    if let Some(app) = app {
+        let _ = app.emit("op-progress", serde_json::json!({
+            "done": done, "total": total, "current": current,
+        }));
+    }
+}
+
+/// 跨盘符安全移动目录：copy 目录树 → 校验文件数 → 删除源。
+/// 同盘符直接 rename。
+fn move_dir(src: &Path, dst: &Path) -> Result<(), String> {
+    move_dir_with_progress(src, dst, None)
+}
+
+fn move_dir_with_progress(src: &Path, dst: &Path, app: Option<&tauri::AppHandle>) -> Result<(), String> {
+    if dst.exists() {
+        return Err(format!("目标已存在：{}", dst.display()));
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目标父目录失败：{e}"))?;
+    }
+    // 同盘符优先 rename（原子）
+    if same_volume(src, dst) {
+        if fs::rename(src, dst).is_ok() {
+            return Ok(());
+        }
+        // rename 失败则退回 copy+delete
+    }
+    copy_dir_recursive(src, dst)?;
+    // 校验：源/目标文件数一致才删源
+    let src_count = count_files(src);
+    let dst_count = count_files(dst);
+    if src_count != dst_count {
+        return Err(format!(
+            "移动校验失败：源 {src_count} 个文件，目标 {dst_count} 个文件。源目录未删除，请手动检查。"
+        ));
+    }
+    fs::remove_dir_all(src).map_err(|e| format!("删除源目录失败：{e}"))?;
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    copy_dir_progress(src, dst, None, &mut 0, 0)
+}
+
+fn copy_dir_progress(
+    src: &Path,
+    dst: &Path,
+    cb: ProgressFn,
+    done: &mut u64,
+    total: u64,
+) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("创建目录失败：{e}"))?;
+    for entry in fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))? {
+        let entry = entry.map_err(|e| format!("读取条目失败：{e}"))?;
+        let ty = entry.file_type().map_err(|e| format!("读取类型失败：{e}"))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_progress(&from, &to, cb, done, total)?;
+        } else if ty.is_file() {
+            fs::copy(&from, &to).map_err(|e| format!("复制 {} 失败：{e}", from.display()))?;
+            *done += 1;
+            emit_progress(cb, *done, total, &from.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+        }
+        // symlink 条目跳过（接管前理论上不应有）
+    }
+    Ok(())
+}
+
+fn count_files(root: &Path) -> u64 {
+    let mut n = 0;
+    for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+        if entry.file_type().is_file() {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn repo_files_dir(repo: &Path, home_id: &str) -> PathBuf {
+    repo.join("adopted").join(home_id).join("files")
+}
+
+fn adopt_record_path(repo: &Path, home_id: &str) -> PathBuf {
+    repo.join("adopted").join(home_id).join("record.json")
+}
+
+/// 读取某 home 的接管记录（若已接管）。
+pub fn read_adopt_record(repo: &Path, home_path: &Path) -> Option<AdoptRecord> {
+    let id = home_id_of(home_path);
+    let p = adopt_record_path(repo, &id);
+    let text = fs::read_to_string(p).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 判断 home 是否已被接管（原位置是否已是 symlink）。
+pub fn is_adopted(home_path: &Path) -> bool {
+    let sessions = home_path.join("sessions");
+    sessions
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// 接管一个 DSH Home。
+/// 前置：DSH 未运行（调用方已检测）、home 未被接管。
+pub fn adopt_home(repo: &Path, home_path: &Path, note: &str) -> Result<AdoptResult, String> {
+    adopt_home_with_progress(repo, home_path, note, None)
+}
+
+/// 带进度回调的接管（app 用于 emit op-progress 事件）。
+pub fn adopt_home_with_progress(
+    repo: &Path,
+    home_path: &Path,
+    note: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<AdoptResult, String> {
+    // 1. 运行检测（双保险）
+    let running = detect_dsh_processes();
+    if !running.is_empty() {
+        return Err(format!(
+            "检测到 DSH 正在运行（{}），请先完全关闭所有 DSH 窗口后再接管。",
+            running.join(", ")
+        ));
+    }
+    // 2. 重复接管检测
+    if is_adopted(home_path) {
+        return Err("该环境已被接管（sessions 已是链接），无需重复接管。".to_string());
+    }
+    if !crate::scanner::is_confirmed_home(home_path) {
+        return Err("该目录未通过 DSH Home 特征校验，无法接管。".to_string());
+    }
+
+    let home_id = home_id_of(home_path);
+    let files_root = repo_files_dir(repo, &home_id);
+    fs::create_dir_all(&files_root).map_err(|e| format!("创建仓库目录失败：{e}"))?;
+
+    let mut moved_dirs = Vec::new();
+    let mut created_links = Vec::new();
+    let mut links = Vec::new();
+    let mut warnings = Vec::new();
+
+    // 3. 逐个移动 ADOPT_DIRS 并创建 symlink
+    for dir in ADOPT_DIRS {
+        let src = home_path.join(dir);
+        if !src.is_dir() {
+            continue;
+        }
+        // 防御：若已是 symlink 则跳过
+        if src.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            warnings.push(format!("{dir} 已是链接，跳过"));
+            continue;
+        }
+        let dst = files_root.join(dir);
+        // 进度：接管移动大目录时报告
+        let total = count_files(&src);
+        emit_op_progress(app, 0, total, &format!("正在移动 {dir}"));
+        move_dir_with_progress(&src, &dst, app)?;
+        emit_op_progress(app, total, total, &format!("{dir} 完成"));
+        moved_dirs.push(dir.to_string());
+
+        let target_str = create_dir_link(&src, &dst).map_err(|e| format!("为 {dir} 创建链接失败：{e}"))?;
+        created_links.push(dir.to_string());
+        let absolute = !same_volume(&src, &dst);
+        links.push(LinkMapping {
+            rel: dir.to_string(),
+            target: target_str,
+            absolute,
+        });
+    }
+
+    // 4. profiles/ 声明文件备份（不移动 profiles 本体）
+    let mut profile_decl = 0u32;
+    let profiles = home_path.join("profiles");
+    if profiles.is_dir() {
+        if let Ok(entries) = fs::read_dir(&profiles) {
+            for profile in entries.flatten() {
+                if !profile.path().is_dir() {
+                    continue;
+                }
+                let pname = profile.file_name().to_string_lossy().to_string();
+                for f in PROFILE_DECL_FILES {
+                    let src_f = profile.path().join(f);
+                    if src_f.is_file() {
+                        let dst_f = repo.join("adopted").join(&home_id).join("profiles").join(&pname).join(f);
+                        if let Some(parent) = dst_f.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        if fs::copy(&src_f, &dst_f).is_ok() {
+                            profile_decl += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. 写接管标记与记录
+    // 4.5 生成接管时的文件清单（SHA-256），供后续变更检测
+    let mut manifest = std::collections::HashMap::new();
+    for link in &links {
+        let store = files_root.join(&link.rel);
+        if !store.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&store).follow_links(false).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(&store).unwrap().to_string_lossy().replace('\\', "/");
+            let key = format!("{}/{}", link.rel, rel);
+            if let Ok(bytes) = fs::read(entry.path()) {
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                manifest.insert(key, format!("{:x}", h.finalize()));
+            }
+        }
+    }
+
+    let record = AdoptRecord {
+        version: 2,
+        manifest,
+        home_id: home_id.clone(),
+        home_path: home_path.to_string_lossy().to_string(),
+        note: note.to_string(),
+        adopted_at: now_string(),
+        links,
+    };
+    let record_path = adopt_record_path(repo, &home_id);
+    if let Some(parent) = record_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string_pretty(&record).map_err(|e| format!("序列化接管记录失败：{e}"))?;
+    fs::write(&record_path, json).map_err(|e| format!("写入接管记录失败：{e}"))?;
+    // 标记文件（防止误删 + 供扫描识别）
+    let _ = fs::write(repo.join("adopted").join(&home_id).join(ADOPT_MARK), &record.adopted_at);
+
+    // 模块六：接管后自动塞 AI 小纸条（失败不阻断接管）
+    let _ = write_ai_note(repo, home_path);
+
+    Ok(AdoptResult {
+        home_id,
+        moved_dirs,
+        created_links,
+        profile_decl_files: profile_decl,
+        warnings,
+    })
+}
+
+/// 断开接管：删除 symlink，把仓库里的目录移回原位置。
+pub fn unadopt_home(repo: &Path, home_path: &Path) -> Result<UnadoptResult, String> {
+    let running = detect_dsh_processes();
+    if !running.is_empty() {
+        return Err(format!(
+            "检测到 DSH 正在运行（{}），请先完全关闭后再断开接管。",
+            running.join(", ")
+        ));
+    }
+    let home_id = home_id_of(home_path);
+    let record = read_adopt_record(repo, home_path)
+        .ok_or_else(|| "未找到接管记录，无法断开接管。".to_string())?;
+    let files_root = repo_files_dir(repo, &home_id);
+
+    let mut restored = Vec::new();
+    let mut warnings = Vec::new();
+
+    for link in &record.links {
+        let link_path = home_path.join(&link.rel);
+        let store_path = files_root.join(&link.rel);
+        if !store_path.is_dir() {
+            warnings.push(format!("仓库中缺少 {}，跳过还原", link.rel));
+            continue;
+        }
+        // 删除 symlink（不删目标）
+        if link_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            fs::remove_dir(&link_path).map_err(|e| format!("删除链接 {} 失败：{e}", link.rel))?;
+        } else if link_path.exists() {
+            warnings.push(format!("{} 位置已有真实目录，跳过还原以免覆盖", link.rel));
+            continue;
+        }
+        move_dir(&store_path, &link_path).map_err(|e| format!("还原 {} 失败：{e}", link.rel))?;
+        restored.push(link.rel.clone());
+    }
+
+    // 清理记录与标记
+    let _ = fs::remove_file(adopt_record_path(repo, &home_id));
+    let _ = fs::remove_file(repo.join("adopted").join(&home_id).join(ADOPT_MARK));
+
+    // 模块六：断开接管时移除小纸条
+    let _ = remove_ai_note(home_path);
+
+    Ok(UnadoptResult {
+        home_id,
+        restored_dirs: restored,
+        warnings,
+    })
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeInfo {
+    pub rel: String,
+    pub kind: String, // "modified" | "added" | "deleted"
+}
+
+/// 检测 DSH 对已接管文件的修改（对比接管时的 SHA-256 清单）。
+/// 读取通过 symlink 的当前文件，与接管清单对比。
+pub fn check_home_changes(repo: &Path, home_path: &Path) -> Result<Vec<ChangeInfo>, String> {
+    let record = read_adopt_record(repo, home_path)
+        .ok_or_else(|| "该环境未被接管，无法检测变更。".to_string())?;
+    let mut changes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for link in &record.links {
+        let live = home_path.join(&link.rel); // 通过 symlink 读当前
+        if !live.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&live).follow_links(false).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(&live).unwrap().to_string_lossy().replace('\\', "/");
+            let key = format!("{}/{}", link.rel, rel);
+            seen.insert(key.clone());
+            let cur_hash = fs::read(entry.path()).ok().map(|bytes| {
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                format!("{:x}", h.finalize())
+            });
+            match record.manifest.get(&key) {
+                Some(old) => {
+                    if Some(old) != cur_hash.as_ref() {
+                        changes.push(ChangeInfo { rel: key, kind: "modified".into() });
+                    }
+                }
+                None => changes.push(ChangeInfo { rel: key, kind: "added".into() }),
+            }
+        }
+    }
+    // 清单里有、当前没有 → deleted
+    for key in record.manifest.keys() {
+        if !seen.contains(key) {
+            changes.push(ChangeInfo { rel: key.clone(), kind: "deleted".into() });
+        }
+    }
+    Ok(changes)
+}
+
+
+// ===================== 切换（switch）=====================
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchResult {
+    pub switched_links: u32,
+    pub backup_snapshot: String,
+    pub details: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// 把 source_home 的内容切到 target_home：target 的 symlink 改指向 source 的仓库目录。
+/// 类型：sessions/skills/config/memories。切换前给 target 做保险快照（记录清单 + 备份小文件）。
+pub fn switch_links(
+    repo: &Path,
+    source_home: &Path,
+    target_home: &Path,
+    include_sessions: bool,
+    include_skills: bool,
+    include_config: bool,
+    include_memories: bool,
+) -> Result<SwitchResult, String> {
+    // 1. 校验
+    if source_home == target_home {
+        return Err("来源与目标不能是同一个环境。".to_string());
+    }
+    let running = detect_dsh_processes();
+    if !running.is_empty() {
+        return Err(format!("检测到 DSH 正在运行（{}），请先完全关闭后再切换。", running.join(", ")));
+    }
+    if read_adopt_record(repo, source_home).is_none() {
+        return Err("来源环境未接管，请先在「环境」页接管。".to_string());
+    }
+    if read_adopt_record(repo, target_home).is_none() {
+        return Err("目标环境未接管，请先在「环境」页接管。".to_string());
+    }
+
+    // 2. 确定要切换的子目录
+    let mut dirs: Vec<&str> = Vec::new();
+    if include_sessions { dirs.push("sessions"); }
+    if include_skills { dirs.push("skills"); }
+    if include_config { dirs.extend([".agent-presets", "guard", "storages", "rollbacks", "undo-snapshots"]); }
+    if include_memories { dirs.extend(["memories", "team"]); }
+    if dirs.is_empty() {
+        return Err("未选择任何要切换的内容类型。".to_string());
+    }
+
+    let src_id = home_id_of(source_home);
+    let tgt_id = home_id_of(target_home);
+    let src_files = repo_files_dir(repo, &src_id);
+    let tgt_files = repo_files_dir(repo, &tgt_id);
+    fs::create_dir_all(&tgt_files).map_err(|e| format!("创建目标存档目录失败：{e}"))?;
+
+    // 来源标签（用于保险快照命名）
+    let src_label = source_home.file_name().and_then(|v| v.to_str()).unwrap_or("source").to_string();
+
+    // 3. 给目标环境做保险快照：把目标自己的原件完整复制到命名快照目录
+    let snap_name = format!(
+        "{}-切自{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        src_label
+    );
+    let snap_root = repo.join("switch-backups").join(&tgt_id).join(&snap_name);
+    let mut details = Vec::new();
+    let mut warnings = Vec::new();
+
+    for dir in &dirs {
+        let tgt_store = tgt_files.join(dir);
+        if tgt_store.is_dir() {
+            let dst = snap_root.join(dir);
+            copy_dir_recursive(&tgt_store, &dst)
+                .map_err(|e| format!("备份目标的 {dir} 失败：{e}"))?;
+        }
+    }
+
+    // 4. 复制式切换：把来源内容复制进目标自己的存档（链接不动，仍指向自己）
+    let mut switched = 0u32;
+    for dir in &dirs {
+        let src_store = src_files.join(dir);
+        if !src_store.is_dir() {
+            continue; // 来源没有该类型内容
+        }
+        let tgt_store = tgt_files.join(dir);
+        // 清空目标旧内容（已备份到保险快照），再复制来源内容
+        if tgt_store.is_dir() {
+            fs::remove_dir_all(&tgt_store).map_err(|e| format!("清空目标 {dir} 失败：{e}"))?;
+        }
+        copy_dir_recursive(&src_store, &tgt_store)
+            .map_err(|e| format!("把来源的 {dir} 复制给目标失败：{e}"))?;
+        switched += 1;
+        details.push(format!("{dir} 已复制"));
+    }
+    if switched == 0 {
+        return Err("没有可切换的内容：来源环境在所选类型下都没有内容。".to_string());
+    }
+
+    // 5. 写保险快照索引
+    let index_path = repo.join("switch-backups").join(&tgt_id).join("index.json");
+    let mut index: serde_json::Value = fs::read_to_string(&index_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({"snapshots": []}));
+    let file_count = count_files(&snap_root);
+    index["snapshots"].as_array_mut().map(|arr| {
+        arr.push(serde_json::json!({
+            "name": snap_name,
+            "time": now_string(),
+            "from": source_home.to_string_lossy(),
+            "fromLabel": src_label,
+            "dirs": dirs,
+            "fileCount": file_count,
+        }));
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&index) {
+        let _ = fs::write(&index_path, text);
+    }
+
+    Ok(SwitchResult {
+        switched_links: switched,
+        backup_snapshot: snap_name,
+        details,
+        warnings,
+    })
+}
+
+
+// ===================== 错位修复（repair）=====================
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairAction {
+    pub rel: String,
+    pub action: String,       // "repoint" | "remove" | "ok" | "skip"
+    pub from: String,         // 当前指向（root id 或描述）
+    pub to: String,           // 修复后指向
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairPreview {
+    pub home_id: String,
+    pub home_path: String,
+    pub actions: Vec<RepairAction>,
+    pub broken_count: u32,
+}
+
+/// 从 symlink 的 target 解析出它指向的 root id（形如 .../adopted/<root>/files/<dir>）。
+fn root_of_link_target(target: &Path) -> Option<String> {
+    let comps: Vec<String> = target.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+    for (i, c) in comps.iter().enumerate() {
+        if c == "adopted" && i + 1 < comps.len() {
+            return Some(comps[i + 1].clone());
+        }
+    }
+    None
+}
+
+/// 分析一个 home 的错位情况（只读，不修改）。
+pub fn preview_repair(repo: &Path, home_path: &Path) -> Result<RepairPreview, String> {
+    let home_id = home_id_of(home_path);
+    let files_root = repo_files_dir(repo, &home_id);
+    let mut actions = Vec::new();
+    let mut broken = 0u32;
+
+    for dir in ADOPT_DIRS {
+        let link_path = home_path.join(dir);
+        let Ok(meta) = link_path.symlink_metadata() else { continue };
+        if !meta.file_type().is_symlink() {
+            continue; // 真实目录：未接管该目录，不动
+        }
+        let target = fs::read_link(&link_path).map_err(|e| format!("读取链接 {dir} 失败：{e}"))?;
+        // 相对路径转绝对
+        let abs_target = if target.is_absolute() {
+            target.clone()
+        } else {
+            link_path.parent().unwrap_or(home_path).join(&target)
+        };
+        let pointed_root = root_of_link_target(&abs_target).unwrap_or_default();
+        if pointed_root == home_id {
+            actions.push(RepairAction {
+                rel: dir.to_string(),
+                action: "ok".into(),
+                from: pointed_root,
+                to: home_id.clone(),
+                reason: "指向自己，正常".into(),
+            });
+            continue;
+        }
+        // 错位
+        broken += 1;
+        let own_store = files_root.join(dir);
+        if own_store.is_dir() {
+            actions.push(RepairAction {
+                rel: dir.to_string(),
+                action: "repoint".into(),
+                from: pointed_root.clone(),
+                to: home_id.clone(),
+                reason: "指回自己的存档（自己的内容在仓库中完好）".into(),
+            });
+        } else {
+            // 自己的仓库里没有：看保险快照能不能补
+            let mut found_in_backup = false;
+            let backups = repo.join("switch-backups").join(&home_id);
+            if backups.is_dir() {
+                if let Ok(mut snaps) = fs::read_dir(&backups).map(|rd| rd.flatten().collect::<Vec<_>>()) {
+                    snaps.sort_by_key(|e| e.file_name());
+                    if let Some(last) = snaps.last() {
+                        if last.path().join(dir).is_dir() {
+                            found_in_backup = true;
+                        }
+                    }
+                }
+                let _ = &mut found_in_backup;
+            }
+            if found_in_backup {
+                actions.push(RepairAction {
+                    rel: dir.to_string(),
+                    action: "repoint".into(),
+                    from: pointed_root.clone(),
+                    to: home_id.clone(),
+                    reason: "先从保险快照找回自己的内容，再指回".into(),
+                });
+            } else {
+                actions.push(RepairAction {
+                    rel: dir.to_string(),
+                    action: "remove".into(),
+                    from: pointed_root.clone(),
+                    to: String::new(),
+                    reason: "这个目录本来不属于此环境（接管时不存在、保险快照也没有），删除错误链接；原内容在别人的存档里不受影响".into(),
+                });
+            }
+        }
+    }
+
+    Ok(RepairPreview {
+        home_id,
+        home_path: home_path.to_string_lossy().to_string(),
+        actions,
+        broken_count: broken,
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairResult {
+    pub home_id: String,
+    pub repointed: Vec<String>,
+    pub removed: Vec<String>,
+    pub restored_from_backup: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// 执行错位修复：让每个链接各回各家。
+pub fn repair_links(repo: &Path, home_path: &Path) -> Result<RepairResult, String> {
+    let running = detect_dsh_processes();
+    if !running.is_empty() {
+        return Err(format!(
+            "检测到 DSH 正在运行（{}），请先完全关闭所有 DSH 窗口后再修复。",
+            running.join(", ")
+        ));
+    }
+    let preview = preview_repair(repo, home_path)?;
+    let home_id = preview.home_id.clone();
+    let files_root = repo_files_dir(repo, &home_id);
+    fs::create_dir_all(&files_root).map_err(|e| format!("创建存档目录失败：{e}"))?;
+
+    let mut repointed = Vec::new();
+    let mut removed = Vec::new();
+    let mut restored = Vec::new();
+    let mut warnings = Vec::new();
+
+    for action in &preview.actions {
+        let link_path = home_path.join(&action.rel);
+        match action.action.as_str() {
+            "repoint" => {
+                let own_store = files_root.join(&action.rel);
+                // 自己的存档不存在时，先从最新保险快照恢复
+                if !own_store.is_dir() {
+                    let backups = repo.join("switch-backups").join(&home_id);
+                    let mut latest: Option<PathBuf> = None;
+                    if let Ok(mut snaps) = fs::read_dir(&backups).map(|rd| rd.flatten().collect::<Vec<_>>()) {
+                        snaps.sort_by_key(|e| e.file_name());
+                        for s in snaps.into_iter().rev() {
+                            if s.path().join(&action.rel).is_dir() {
+                                latest = Some(s.path().join(&action.rel));
+                                break;
+                            }
+                        }
+                    }
+                    let Some(src_snap) = latest else {
+                        warnings.push(format!("{} 找不到自己的存档，跳过", action.rel));
+                        continue;
+                    };
+                    copy_dir_recursive(&src_snap, &own_store)
+                        .map_err(|e| format!("从保险快照恢复 {} 失败：{e}", action.rel))?;
+                    restored.push(action.rel.clone());
+                }
+                // 删除错位的 symlink，指回自己
+                if link_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                    fs::remove_dir(&link_path).map_err(|e| format!("删除错位链接 {} 失败：{e}", action.rel))?;
+                }
+                create_dir_link(&link_path, &own_store)
+                    .map_err(|e| format!("为 {} 创建归位链接失败：{e}", action.rel))?;
+                repointed.push(action.rel.clone());
+            }
+            "remove" => {
+                if link_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                    fs::remove_dir(&link_path).map_err(|e| format!("删除多余链接 {} 失败：{e}", action.rel))?;
+                    removed.push(action.rel.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(RepairResult {
+        home_id,
+        repointed,
+        removed,
+        restored_from_backup: restored,
+        warnings,
+    })
+}
+
+
+// ===================== AI 小纸条（接管时自动塞）=====================
+
+const NOTE_SKILL_DIR: &str = "dsh-vault-manager";
+const NOTE_BEGIN: &str = "<!-- DSH-VAULT-NOTE-BEGIN -->";
+const NOTE_END: &str = "<!-- DSH-VAULT-NOTE-END -->";
+
+fn note_skill_md(home_label: &str, repo: &Path) -> String {
+    format!(
+        r#"---
+name: dsh-vault-manager
+description: 本环境的对话、技能与配置由 DSH Vault 统一备份与管理。当用户询问环境迁移、对话找回、备份恢复、或当前文件为何是链接时阅读本说明。
+---
+
+# 本环境由 DSH Vault 统一管理
+
+你好，我是这个 DeepSeek Harness 环境的"管家纸条"。
+
+## 你需要知道的事
+- 「{home_label}」的对话记录（sessions/）、技能（skills/）、预设（.agent-presets/）等，**正由 DSH Vault 这个工具统一保管**。
+- 你在本环境目录里看到的这些文件夹，其实是**链接（symlink）**，真正的文件存放在 DSH Vault 的仓库里：`{repo}`
+- **这是正常现象，请放心照常读写**——读写到链接，就等于读写到仓库里的真身，DSH 和 DSH Vault 都会同步看到。
+
+## 你可以做什么
+- 正常使用本环境即可，不需要任何额外操作。
+- 如果用户想**找回历史对话**、**把对话搬到另一个 DSH 版本**、或**备份/还原整个环境**，请引导用户打开「DSH Vault」程序，或调用它的 MCP 工具（scan_homes / create_backup / switch_env）。
+- 如果某个链接失效（指向的目录不存在），说明仓库文件可能被移动了，请提醒用户打开 DSH Vault 检查，不要自行删除链接。
+
+## 不要做的事
+- 不要删除 sessions/、skills/ 等目录链接（那会切断与仓库的连接）。
+- 不要把这些链接目录当成普通文件夹整体移动或压缩（会只打包到链接本身而非真实内容）。
+"#,
+        home_label = home_label,
+        repo = repo.to_string_lossy()
+    )
+}
+
+/// 接管后：往 skills/ 塞小纸条技能，并往 AGENTS.md 追加一行。
+pub fn write_ai_note(repo: &Path, home_path: &Path) -> Result<(), String> {
+    let home_label = home_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("这个环境")
+        .to_string();
+    // 1) skills/dsh-vault-manager/SKILL.md（skills 已被接管为链接，写到链接里即写到仓库）
+    let skills = home_path.join("skills");
+    if skills.is_dir() {
+        let dir = skills.join(NOTE_SKILL_DIR);
+        fs::create_dir_all(&dir).map_err(|e| format!("创建小纸条目录失败：{e}"))?;
+        fs::write(dir.join("SKILL.md"), note_skill_md(&home_label, repo))
+            .map_err(|e| format!("写入小纸条失败：{e}"))?;
+    }
+    // 2) AGENTS.md 追加一行（幂等：已有则跳过）
+    let agents_md = home_path.join("AGENTS.md");
+    let pointer = format!(
+        "{NOTE_BEGIN}
+- 本环境的对话/技能/配置由 **DSH Vault** 统一管理（本地为链接，实体在仓库 `{repo}`）。详见 `skills/{NOTE_SKILL_DIR}/SKILL.md`。
+{NOTE_END}",
+        repo = repo.to_string_lossy(),
+        NOTE_SKILL_DIR = NOTE_SKILL_DIR,
+        NOTE_BEGIN = NOTE_BEGIN,
+        NOTE_END = NOTE_END
+    );
+    let existing = fs::read_to_string(&agents_md).unwrap_or_default();
+    if !existing.contains(NOTE_BEGIN) {
+        let mut content = existing;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&pointer);
+        content.push('\n');
+        fs::write(&agents_md, content).map_err(|e| format!("写入 AGENTS.md 失败：{e}"))?;
+    }
+    Ok(())
+}
+
+/// 断开接管时：移除小纸条。
+pub fn remove_ai_note(home_path: &Path) -> Result<(), String> {
+    let skills = home_path.join("skills");
+    let dir = skills.join(NOTE_SKILL_DIR);
+    if dir.is_dir() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    // 移除 AGENTS.md 里的小纸条块
+    let agents_md = home_path.join("AGENTS.md");
+    if let Ok(existing) = fs::read_to_string(&agents_md) {
+        if existing.contains(NOTE_BEGIN) {
+            let mut out = String::new();
+            let mut in_block = false;
+            for line in existing.lines() {
+                if line.contains(NOTE_BEGIN) {
+                    in_block = true;
+                    continue;
+                }
+                if line.contains(NOTE_END) {
+                    in_block = false;
+                    continue;
+                }
+                if !in_block {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            let _ = fs::write(&agents_md, out);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_same_volume() {
+        let from = Path::new(r"C:\Users\me\.dsh");
+        let to = Path::new(r"C:\Users\me\repo\files\sessions");
+        let rel = relative_path(from, to).unwrap();
+        assert_eq!(rel, PathBuf::from(r"..\repo\files\sessions"));
+    }
+
+    #[test]
+    fn same_volume_check() {
+        assert!(same_volume(Path::new(r"C:\a"), Path::new(r"C:\b")));
+        assert!(!same_volume(Path::new(r"C:\a"), Path::new(r"D:\b")));
+    }
+
+    #[test]
+    fn e2e_adopt_and_unadopt() {
+        // 造一个模拟 DSH Home
+        let base = std::env::temp_dir().join(format!("dsh-vault-e2e-{}", std::process::id()));
+        let home = base.join("home");
+        let repo = base.join("repo");
+        let sessions = home.join("sessions").join("proj").join("sess1");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("session.jsonl.zstd"), b"fake-zstd-data").unwrap();
+        fs::create_dir_all(home.join("skills").join("myskill")).unwrap();
+        fs::write(home.join("skills").join("myskill").join("SKILL.md"), b"# skill").unwrap();
+        fs::write(home.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::write(home.join(".credentials.yaml"), b"token: x").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+
+        // adopt
+        let result = adopt_home(&repo, &home, "e2e测试").expect("adopt 应成功");
+        assert!(result.moved_dirs.contains(&"sessions".to_string()));
+        assert!(result.moved_dirs.contains(&"skills".to_string()));
+
+        // 验证：原位置 sessions 是 symlink
+        let sess_link = home.join("sessions");
+        let meta = sess_link.symlink_metadata().unwrap();
+        assert!(meta.file_type().is_symlink(), "sessions 应成为 symlink");
+
+        // 验证：通过 symlink 能读到仓库里的文件
+        let content = fs::read(sess_link.join("proj").join("sess1").join("session.jsonl.zstd")).unwrap();
+        assert_eq!(content, b"fake-zstd-data");
+
+        // 验证：仓库里有接管记录
+        let record = read_adopt_record(&repo, &home).expect("应有接管记录");
+        assert!(record.links.iter().any(|l| l.rel == "sessions"));
+
+        // unadopt
+        let un = unadopt_home(&repo, &home).expect("unadopt 应成功");
+        assert!(un.restored_dirs.contains(&"sessions".to_string()));
+        // 还原后 sessions 是真实目录
+        let meta2 = home.join("sessions").symlink_metadata().unwrap();
+        assert!(!meta2.file_type().is_symlink(), "还原后 sessions 应是真实目录");
+        assert_eq!(fs::read(home.join("sessions").join("proj").join("sess1").join("session.jsonl.zstd")).unwrap(), b"fake-zstd-data");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+
+    #[test]
+    fn e2e_change_detection() {
+        let base = std::env::temp_dir().join(format!("dsh-vault-chg-{}", std::process::id()));
+        let home = base.join("home");
+        let repo = base.join("repo");
+        let sess = home.join("sessions").join("proj").join("s1");
+        fs::create_dir_all(&sess).unwrap();
+        fs::write(sess.join("session.jsonl.zstd"), b"original").unwrap();
+        fs::write(home.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+
+        adopt_home(&repo, &home, "chg").unwrap();
+        // 初始无变更
+        let c0 = check_home_changes(&repo, &home).unwrap();
+        assert!(c0.is_empty(), "接管后应立即无变更，实际 {:?}", c0.iter().map(|c|&c.rel).collect::<Vec<_>>());
+
+        // 修改一个文件（通过 symlink）
+        fs::write(home.join("sessions").join("proj").join("s1").join("session.jsonl.zstd"), b"modified").unwrap();
+        // 新增一个文件
+        fs::write(home.join("sessions").join("proj").join("new.jsonl.zstd"), b"new").unwrap();
+
+        let c1 = check_home_changes(&repo, &home).unwrap();
+        let kinds: std::collections::HashMap<_,_> = c1.iter().map(|c| (c.kind.as_str(), c.rel.clone())).collect();
+        assert!(kinds.values().any(|r| r.contains("session.jsonl.zstd") ), "应检测到修改: {:?}", c1);
+        assert!(c1.iter().any(|c| c.kind == "added"), "应检测到新增: {:?}", c1.iter().map(|x|(&x.kind,&x.rel)).collect::<Vec<_>>());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+
+    #[test]
+    fn e2e_switch_links() {
+        let base = std::env::temp_dir().join(format!("dsh-vault-sw-{}", std::process::id()));
+        let repo = base.join("repo");
+        // 来源环境 A：有自己的对话
+        let home_a = base.join("homeA");
+        fs::create_dir_all(home_a.join("sessions").join("projA").join("s1")).unwrap();
+        fs::write(home_a.join("sessions").join("projA").join("s1").join("session.jsonl.zstd"), b"A-data").unwrap();
+        fs::write(home_a.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        // 目标环境 B：有自己的对话
+        let home_b = base.join("homeB");
+        fs::create_dir_all(home_b.join("sessions").join("projB").join("s2")).unwrap();
+        fs::write(home_b.join("sessions").join("projB").join("s2").join("session.jsonl.zstd"), b"B-data").unwrap();
+        fs::write(home_b.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+
+        // 两个都接管
+        adopt_home(&repo, &home_a, "A").unwrap();
+        adopt_home(&repo, &home_b, "B").unwrap();
+
+        // 切换：把 A 的 sessions 切到 B
+        let result = switch_links(&repo, &home_a, &home_b, true, false, false, false).expect("切换应成功");
+        assert_eq!(result.switched_links, 1);
+
+        // 验证：B 的 sessions 现在指向 A 的内容（能读到 A-data）
+        let content = fs::read(home_b.join("sessions").join("projA").join("s1").join("session.jsonl.zstd")).unwrap();
+        assert_eq!(content, b"A-data", "切换后 B 应能读到 A 的对话");
+
+        // 验证：保险快照里有 B 原来的内容
+        let snap = repo.join("switch-backups").join(home_id_of(&home_b)).join(&result.backup_snapshot);
+        let b_old = fs::read(snap.join("sessions").join("projB").join("s2").join("session.jsonl.zstd")).unwrap();
+        assert_eq!(b_old, b"B-data", "保险快照应保存 B 原对话");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+
+    #[test]
+    fn e2e_repair_links() {
+        let base = std::env::temp_dir().join(format!("dsh-vault-repair-{}", std::process::id()));
+        let repo = base.join("repo");
+        // 环境 A、B 各有内容并接管
+        let home_a = base.join("homeA");
+        fs::create_dir_all(home_a.join("sessions").join("pA").join("s1")).unwrap();
+        fs::write(home_a.join("sessions").join("pA").join("s1").join("session.jsonl.zstd"), b"A").unwrap();
+        fs::write(home_a.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        let home_b = base.join("homeB");
+        fs::create_dir_all(home_b.join("sessions").join("pB").join("s2")).unwrap();
+        fs::write(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd"), b"B").unwrap();
+        fs::write(home_b.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        adopt_home(&repo, &home_a, "A").unwrap();
+        adopt_home(&repo, &home_b, "B").unwrap();
+
+        // 旧链接式切换把 B 的 sessions 指向 A（模拟错位）
+        let a_files = repo_files_dir(&repo, &home_id_of(&home_a));
+        fs::remove_dir(home_b.join("sessions")).unwrap(); // 删 B 的 symlink
+        create_dir_link(&home_b.join("sessions"), &a_files.join("sessions")).unwrap(); // 错指到 A
+
+        // 预览应检测到 sessions 错位
+        let preview = preview_repair(&repo, &home_b).unwrap();
+        assert_eq!(preview.broken_count, 1, "应检测到 1 个错位: {:?}", preview.actions.iter().map(|a|(&a.rel,&a.action)).collect::<Vec<_>>());
+        let sess_action = preview.actions.iter().find(|a| a.rel == "sessions").unwrap();
+        assert_eq!(sess_action.action, "repoint");
+
+        // 执行修复
+        let result = repair_links(&repo, &home_b).unwrap();
+        assert!(result.repointed.contains(&"sessions".to_string()));
+        // 修复后 B 读到自己的 B 内容
+        let content = fs::read(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd")).unwrap();
+        assert_eq!(content, b"B", "修复后 B 应读回自己的对话");
+        // A 仍读自己的 A 内容（未被破坏）
+        let acontent = fs::read(home_a.join("sessions").join("pA").join("s1").join("session.jsonl.zstd")).unwrap();
+        assert_eq!(acontent, b"A");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn e2e_switch_copy_based() {
+        // 复制式切换：目标原件进保险快照，目标读到来源内容，链接仍指向自己
+        let base = std::env::temp_dir().join(format!("dsh-vault-swcopy-{}", std::process::id()));
+        let repo = base.join("repo");
+        let home_a = base.join("homeA");
+        fs::create_dir_all(home_a.join("sessions").join("pA").join("s1")).unwrap();
+        fs::write(home_a.join("sessions").join("pA").join("s1").join("session.jsonl.zstd"), b"A").unwrap();
+        fs::write(home_a.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        let home_b = base.join("homeB");
+        fs::create_dir_all(home_b.join("sessions").join("pB").join("s2")).unwrap();
+        fs::write(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd"), b"B").unwrap();
+        fs::write(home_b.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        adopt_home(&repo, &home_a, "A").unwrap();
+        adopt_home(&repo, &home_b, "B").unwrap();
+
+        let result = switch_links(&repo, &home_a, &home_b, true, false, false, false).unwrap();
+        assert_eq!(result.switched_links, 1);
+        // 切换后 B 读到 A 的内容
+        let content = fs::read(home_b.join("sessions").join("pA").join("s1").join("session.jsonl.zstd")).unwrap();
+        assert_eq!(content, b"A");
+        // B 的链接仍指向 B 自己（不混链）
+        let preview = preview_repair(&repo, &home_b).unwrap();
+        assert_eq!(preview.broken_count, 0, "复制式切换后不应有错位: {:?}", preview.actions.iter().map(|a|(&a.rel,&a.action)).collect::<Vec<_>>());
+        // B 的原件在保险快照
+        let snap = repo.join("switch-backups").join(home_id_of(&home_b)).join(&result.backup_snapshot);
+        let b_old = fs::read(snap.join("sessions").join("pB").join("s2").join("session.jsonl.zstd")).unwrap();
+        assert_eq!(b_old, b"B");
+        // 保险快照名带"切自"
+        assert!(result.backup_snapshot.contains("切自"), "快照名应含'切自': {}", result.backup_snapshot);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+
+    #[test]
+    fn e2e_ai_note() {
+        let base = std::env::temp_dir().join(format!("dsh-vault-note-{}", std::process::id()));
+        let home = base.join("home");
+        let repo = base.join("repo");
+        fs::create_dir_all(home.join("sessions").join("p").join("s1")).unwrap();
+        fs::write(home.join("sessions").join("p").join("s1").join("session.jsonl.zstd"), b"x").unwrap();
+        fs::create_dir_all(home.join("skills")).unwrap();
+        fs::write(home.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+
+        adopt_home(&repo, &home, "note").unwrap();
+        // 小纸条技能应已写入（在 skills 链接里）
+        let note = home.join("skills").join("dsh-vault-manager").join("SKILL.md");
+        assert!(note.is_file(), "小纸条技能应存在");
+        let content = fs::read_to_string(&note).unwrap();
+        assert!(content.contains("DSH Vault"), "小纸条应提到 DSH Vault");
+        // AGENTS.md 应有指针块
+        let agents = fs::read_to_string(home.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("DSH-VAULT-NOTE-BEGIN"), "AGENTS.md 应有小纸条块");
+
+        // 断开后小纸条应移除
+        unadopt_home(&repo, &home).unwrap();
+        let agents2 = fs::read_to_string(home.join("AGENTS.md")).unwrap_or_default();
+        assert!(!agents2.contains("DSH-VAULT-NOTE-BEGIN"), "断开后 AGENTS.md 小纸条应移除");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+}

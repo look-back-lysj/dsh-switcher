@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DSH Vault</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.2-2.8 7.4-7 9-4.2-1.6-7-4.8-7-9V6l7-3z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div>
+          <h1>DSH Vault</h1>
+          <p>备份 · 迁移 · 恢复</p>
+        </div>
+      </div>
+      <nav aria-label="主导航">
+        <button class="nav-item is-active" data-view="environment" type="button">
+          <span>环境</span><small>扫描 · 接管</small>
+        </button>
+        <button class="nav-item" data-view="archive" type="button">
+          <span>存档</span><small>备份 · 时光机</small>
+        </button>
+        <button class="nav-item" data-view="switch" type="button">
+          <span>切换</span><small>环境互换</small>
+        </button>
+      </nav>
+      <div class="sidebar-note">
+        <strong>默认仓库</strong>
+        <span id="default-repo">正在读取…</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section class="view is-active" id="view-environment" aria-labelledby="health-title">
+        <div class="onboarding" id="onboarding">
+          <div class="onboarding-step">
+            <strong>1 体检</strong>
+            <span>自动扫描本机所有 DSH 环境，不会修改任何文件。</span>
+          </div>
+          <div class="onboarding-step">
+            <strong>2 备份</strong>
+            <span>把对话、技能与配置写入安全仓库，自动排除缓存与依赖包。</span>
+          </div>
+          <div class="onboarding-step">
+            <strong>3 恢复</strong>
+            <span>先预览再执行；默认只补缺，覆盖前自动保存快照。</span>
+          </div>
+          <button class="onboarding-dismiss" id="dismiss-onboarding" type="button" aria-label="关闭引导">知道了</button>
+        </div>
+        <header class="page-header">
+          <div>
+            <h2 id="health-title">环境</h2>
+            <p>自动识别本机所有 DeepSeek Harness 环境。接管后，对话和技能集中管理，可随时切换。</p>
+          </div>
+          <div class="header-actions">
+            <button class="button" id="rescan" type="button">重新扫描</button>
+            <button class="button" id="deep-scan" type="button" title="在所有磁盘深度搜索 DSH 环境（较慢）">深度扫描</button>
+          </div>
+        </header>
+        <div class="summary-grid" id="health-summary"></div>
+        <div class="mismatch-banner" id="mismatch-banner" hidden>
+          <div class="mismatch-banner-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+          </div>
+          <div class="mismatch-banner-text">
+            <strong id="mismatch-title">检测到环境内容错位</strong>
+            <span id="mismatch-desc">某些环境的对话/技能被错误地连到了别的环境。点「一键归位」让每个环境读回自己的内容。</span>
+          </div>
+          <button class="button primary" id="repair-all" type="button">一键归位</button>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <h3>识别到的环境</h3>
+            <span class="muted" id="scan-time"></span>
+          </div>
+          <div class="home-list" id="home-list"></div>
+        </div>
+        <div class="result" id="env-result" hidden></div>
+      </section>
+
+      <section class="view" id="view-archive" aria-labelledby="archive-title">
+        <header class="page-header">
+          <div>
+            <h2 id="archive-title">存档</h2>
+            <p>把识别到的所有 DSH 环境、对话、技能和配置存成安全快照，随时回到任意状态。</p>
+          </div>
+          <div class="header-actions">
+            <button class="button" id="open-advanced" type="button" title="恢复与仓库校验等高级操作">高级操作</button>
+          </div>
+        </header>
+        <div class="subtabs" role="tablist">
+          <button class="subtab is-active" data-subtab="backup" role="tab" type="button">备份</button>
+          <button class="subtab" data-subtab="timemachine" role="tab" type="button">时光机</button>
+        </div>
+        <div class="subpanel is-active" id="subpanel-backup">
+
+        <div class="panel backup-hero">
+          <div class="backup-hero-summary" id="backup-hero-summary">
+            <div class="backup-hero-stat"><strong id="backup-stat-env">—</strong><span>识别到环境</span></div>
+            <div class="backup-hero-stat"><strong id="backup-stat-session">—</strong><span>对话总数</span></div>
+            <div class="backup-hero-stat"><strong id="backup-stat-size">—</strong><span>预计大小</span></div>
+          </div>
+
+          <label class="field backup-note-field">
+            <span>给这次备份起个名字（选填）</span>
+            <input id="backup-note" type="text" spellcheck="false" maxlength="80" placeholder="比如：切换到 4.5 之前" />
+          </label>
+
+          <button class="button primary backup-hero-btn" id="start-backup" type="button">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 3v6c0 4.2-2.8 7.4-7 9-4.2-1.6-7-4.8-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg>
+            立即备份
+          </button>
+
+          <div class="progress-panel" id="backup-progress" hidden>
+            <div class="progress-head">
+              <strong id="backup-progress-title">正在备份</strong>
+              <span id="backup-progress-count">0 / 0</span>
+            </div>
+            <div class="progress-track"><div class="progress-bar" id="backup-progress-bar"></div></div>
+            <div class="progress-file" id="backup-progress-file">正在准备…</div>
+          </div>
+
+          <div class="backup-success" id="backup-success" hidden>
+            <div class="backup-success-icon" aria-hidden="true">
+              <svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="24" fill="none"/><path fill="none" d="M14 27l8 8 16-17"/></svg>
+            </div>
+            <strong>备份完成</strong>
+            <p id="backup-success-text"></p>
+            <div class="backup-success-actions">
+              <button class="button" id="goto-timemachine" type="button">去时光机看看</button>
+              <button class="button" id="backup-again" type="button">再备份一次</button>
+            </div>
+          </div>
+
+          <div class="result" id="backup-result" hidden></div>
+        </div>
+
+        <details class="advanced-panel">
+          <summary>高级选项</summary>
+          <div class="panel advanced-body">
+            <label class="field">
+              <span>备份仓库位置（默认已选好，一般不用改）</span>
+              <div class="input-row">
+                <input id="backup-repo" type="text" spellcheck="false" />
+                <button class="button compact" id="pick-backup-repo" type="button">选择</button>
+              </div>
+            </label>
+            <label class="check-row">
+              <input id="only-config" type="checkbox" />
+              <span>仅备份配置档案（不包含对话与技能）</span>
+            </label>
+            <div class="action-row">
+              <button class="button" id="verify-repo" type="button">校验仓库</button>
+            </div>
+          </div>
+        </details>
+        </div>
+
+        <div class="subpanel" id="subpanel-timemachine">
+        <section class="view-nested" id="view-timemachine" aria-labelledby="timemachine-title">
+        <header class="page-header">
+          <div>
+            <h2 id="timemachine-title">时光机</h2>
+            <p>每一次备份都是一个快照（某一时刻的完整存档）。选一个快照，就能把电脑上的 DSH 环境回到那个时候。</p>
+          </div>
+          <button class="button" id="refresh-snapshots" type="button">刷新列表</button>
+        </header>
+
+        <div class="panel tm-current" id="tm-current-panel">
+          <div class="panel-header">
+            <h3>当前状态</h3>
+            <span class="muted" id="tm-current-time"></span>
+          </div>
+          <div class="tm-current-body" id="tm-current-body">
+            <p class="muted">正在扫描当前环境…</p>
+          </div>
+          <div class="action-row">
+            <button class="button" id="tm-backup-now" type="button">把当前状态存为快照</button>
+          </div>
+        </div>
+
+        <div class="panel tm-snapshots-panel">
+          <div class="panel-header">
+            <h3>历史快照</h3>
+            <span class="muted" id="tm-snapshot-count">0 个</span>
+          </div>
+          <div class="tm-snapshot-list" id="tm-snapshot-list">
+            <div class="empty-state" id="tm-empty">
+              <strong>还没有快照。</strong><br>
+              去「一键备份」创建第一个快照，以后就能随时回到这里。
+            </div>
+          </div>
+        </div>
+
+        <div class="tm-detail" id="tm-detail" hidden>
+          <div class="panel">
+            <div class="panel-header">
+              <h3 id="tm-detail-title">快照详情</h3>
+              <button class="button compact" id="tm-detail-close" type="button">收起</button>
+            </div>
+            <div class="tm-detail-meta" id="tm-detail-meta"></div>
+            <div class="tm-detail-homes" id="tm-detail-homes"></div>
+            <div class="action-row tm-detail-actions">
+              <button class="button primary" id="tm-restore-btn" type="button">回到这个状态</button>
+              <button class="button" id="tm-export-btn" type="button">导出为 zip</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="progress-panel" id="tm-progress" hidden>
+          <div class="progress-head">
+            <strong>正在恢复</strong>
+            <span id="tm-progress-count">0 / 0</span>
+          </div>
+          <div class="progress-track"><div class="progress-bar" id="tm-progress-bar"></div></div>
+          <div class="progress-file" id="tm-progress-file">正在准备…</div>
+        </div>
+        <div class="result" id="tm-result" hidden></div>
+        </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-switch" aria-labelledby="switch-title">
+        <header class="page-header">
+          <div>
+            <h2 id="switch-title">切换</h2>
+            <p>把一个环境的对话、技能和配置切换到另一个环境。两个环境都需要先在「环境」页完成接管。</p>
+          </div>
+        </header>
+
+        <div class="switch-stage" id="switch-stage">
+          <div class="switch-col">
+            <h3 class="switch-col-title">来源环境<small>把它的内容拿过来</small></h3>
+            <div class="switch-list" id="switch-source-list"></div>
+          </div>
+          <div class="switch-arrow" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg>
+          </div>
+          <div class="switch-col">
+            <h3 class="switch-col-title">目标环境<small>内容会被覆盖</small></h3>
+            <div class="switch-list" id="switch-target-list"></div>
+          </div>
+        </div>
+
+        <div class="panel switch-config" id="switch-config" hidden>
+          <div class="switch-config-head">
+            <div class="switch-route">
+              <strong id="switch-route-source"></strong>
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg>
+              <strong id="switch-route-target"></strong>
+            </div>
+            <button class="button compact" id="switch-reset" type="button">重选</button>
+          </div>
+          <p class="muted">选择要切换的内容类型：</p>
+          <div class="switch-types">
+            <label class="switch-type"><input type="checkbox" id="sw-sessions" checked /><span>对话记录</span></label>
+            <label class="switch-type"><input type="checkbox" id="sw-skills" checked /><span>技能</span></label>
+            <label class="switch-type"><input type="checkbox" id="sw-config" checked /><span>配置</span></label>
+            <label class="switch-type"><input type="checkbox" id="sw-memories" checked /><span>记忆</span></label>
+          </div>
+          <div class="switch-warning">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+            <span>切换前会自动给<strong>目标环境</strong>保存一份保险快照，万一不对可以随时切回来。切换期间请关闭所有 DSH 窗口。</span>
+          </div>
+          <button class="button primary switch-execute" id="switch-execute" type="button">开始切换</button>
+          <div class="result" id="switch-result" hidden></div>
+        </div>
+
+        <div class="empty-state" id="switch-empty" hidden>
+          <strong>没有可切换的环境。</strong><br>
+          切换需要至少两个已接管的 DSH 环境。请先到「环境」页，把需要切换的环境都接管。
+        </div>
+      </section>
+
+      <section class="view" id="view-restore" aria-labelledby="restore-title">
+        <header class="page-header">
+          <div>
+            <h2 id="restore-title">恢复</h2>
+            <p>先预览将要新建、跳过和覆盖的文件，再决定是否执行。</p>
+          </div>
+        </header>
+        <div class="panel">
+          <div class="form-grid">
+            <label class="field">
+              <span>备份仓库</span>
+              <div class="input-row">
+                <input id="restore-repo" type="text" spellcheck="false" />
+                <button class="button compact" id="pick-restore-repo" type="button">选择</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>恢复来源</span>
+              <select id="source-home"></select>
+            </label>
+            <label class="field">
+              <span>恢复到</span>
+              <select id="target-home"></select>
+            </label>
+            <label class="field">
+              <span>恢复范围</span>
+              <select id="restore-scope">
+                <option value="config">搬环境：只恢复配置档案</option>
+                <option value="sessions">找会话：只恢复对话记录</option>
+                <option value="home">整机搬家：全部档案</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>覆盖策略</span>
+              <select id="restore-mode">
+                <option value="fill_missing">只补缺（最安全）</option>
+                <option value="merge_newer">备份更新时覆盖</option>
+                <option value="force">强制覆盖全部</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>会话 ID / 项目关键词</span>
+              <input id="restore-filter" type="text" spellcheck="false" placeholder="留空表示全部" />
+            </label>
+          </div>
+          <div class="action-row">
+            <button class="button" id="load-catalog" type="button">读取仓库</button>
+            <button class="button primary" id="preview-restore" type="button">预览恢复</button>
+            <button class="button danger" id="execute-restore" type="button" disabled>执行恢复</button>
+          </div>
+          <div class="result" id="restore-result" hidden></div>
+          <div class="preview-panel" id="restore-preview" hidden>
+            <div class="panel-header">
+              <h3>恢复预览</h3>
+              <span class="muted" id="restore-preview-summary"></span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>动作</th><th>文件</th></tr></thead>
+                <tbody id="restore-preview-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="progress-panel" id="restore-progress" hidden>
+            <div class="progress-head">
+              <strong>正在恢复</strong>
+              <span id="restore-progress-count">0 / 0</span>
+            </div>
+            <div class="progress-track"><div class="progress-bar" id="restore-progress-bar"></div></div>
+            <div class="progress-file" id="restore-progress-file">正在准备…</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-repository" aria-labelledby="repo-title">
+        <header class="page-header">
+          <div>
+            <h2 id="repo-title">仓库</h2>
+            <p>校验文件完整性，导出为单文件备份包，或把备份包导入成新仓库。</p>
+          </div>
+        </header>
+        <div class="summary-grid" id="repo-summary"></div>
+        <div class="panel">
+          <div class="form-grid">
+            <label class="field">
+              <span>当前仓库</span>
+              <div class="input-row">
+                <input id="repository-repo" type="text" spellcheck="false" />
+                <button class="button compact" id="pick-repository-repo" type="button">选择</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>导出文件</span>
+              <div class="input-row">
+                <input id="export-file" type="text" spellcheck="false" />
+                <button class="button compact" id="pick-export-file" type="button">选择</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>导入备份包</span>
+              <div class="input-row">
+                <input id="import-archive" type="text" spellcheck="false" />
+                <button class="button compact" id="pick-import-archive" type="button">选择</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>导入到新仓库</span>
+              <div class="input-row">
+                <input id="import-repo" type="text" spellcheck="false" />
+                <button class="button compact" id="pick-import-repo" type="button">选择</button>
+              </div>
+            </label>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-card-head">
+              <strong>把 DSH Vault 接入 AI（MCP）</strong>
+              <button class="button compact" id="copy-mcp-config" type="button">复制配置</button>
+            </div>
+            <p class="muted">让别的 AI（如支持 MCP 的客户端）能调用本工具的扫描、备份、切换能力。把下面这行配置贴到该 AI 的 MCP 设置里即可。写操作默认只预览，需 AI 显式确认才执行，安全。</p>
+            <pre class="mcp-config" id="mcp-config-text"></pre>
+          </div>
+          <div class="action-row">
+            <button class="button" id="repo-verify" type="button">全量校验</button>
+            <button class="button" id="load-rollback-ledgers" type="button">查看回滚日志</button>
+            <button class="button primary" id="export-backup" type="button">导出备份包</button>
+            <button class="button" id="import-backup" type="button">导入备份包</button>
+            <button class="button danger" id="undo" type="button">撤回上次覆盖</button>
+          </div>
+          <div class="preview-panel" id="rollback-ledgers" hidden>
+            <div class="panel-header">
+              <h3>回滚补偿日志</h3>
+              <span class="muted" id="rollback-ledger-summary"></span>
+            </div>
+            <div class="ledger-list" id="rollback-ledger-list"></div>
+          </div>
+          <div class="result" id="repo-result" hidden></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="op-progress-overlay" id="op-progress-overlay" hidden>
+    <div class="op-progress-card">
+      <div class="op-progress-spinner" aria-hidden="true"></div>
+      <div class="op-progress-body">
+        <strong id="op-progress-title">正在处理</strong>
+        <div class="progress-track"><div class="progress-bar" id="op-progress-bar"></div></div>
+        <span class="op-progress-file" id="op-progress-file">准备中…</span>
+      </div>
+    </div>
+  </div>
+
+  <dialog class="confirm-dialog" id="confirm-dialog">
+    <form method="dialog">
+      <h3 id="confirm-title">确认执行</h3>
+      <p id="confirm-message"></p>
+      <ul class="confirm-list" id="confirm-list"></ul>
+      <div class="confirm-actions">
+        <button class="button" value="cancel" type="submit">取消</button>
+        <button class="button danger" id="confirm-accept" value="accept" type="submit">确认执行</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="./app.js"></script>
+</body>
+</html>
+
+
