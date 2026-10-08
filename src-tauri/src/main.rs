@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod adapters;
 mod adopt;
 mod mcp;
+mod migrate;
 mod model;
 mod oplog;
 mod multiscan;
@@ -426,6 +428,39 @@ async fn fix_presets_now(target_home: String) -> Result<preset_fix::PresetFixRep
 }
 
 #[tauri::command]
+fn list_sessions(home: String) -> Vec<migrate::SessionEntryView> {
+    migrate::list_sessions(&PathBuf::from(home)).into_iter().map(migrate::SessionEntryView::from).collect()
+}
+
+#[tauri::command]
+async fn migrate_sessions(
+    repo: String,
+    source_home: String,
+    target_home: String,
+    session_ids: Vec<String>,
+) -> Result<migrate::MigrateResult, String> {
+    let repo_log = repo.clone();
+    let route = format!("{} → {}", source_home, target_home);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        migrate::migrate_sessions(
+            &PathBuf::from(repo),
+            &PathBuf::from(source_home),
+            &PathBuf::from(target_home),
+            &session_ids,
+        )
+    })
+    .await
+    .map_err(|e| format!("迁移任务中断：{e}"))?;
+    match &result {
+        Ok(r) => oplog::record("migrate", &repo_log, &route,
+            &format!("迁移 {} 条对话（冲突换 id {} 条）", r.migrated, r.remapped_ids), "ok", ""),
+        Err(e) => oplog::record("migrate", &repo_log, &route, "", "fail",
+            &e.chars().take(200).collect::<String>()),
+    }
+    result
+}
+
+#[tauri::command]
 fn check_routability(target_home: String) -> Result<routecheck::RouteCheckReport, String> {
     Ok(routecheck::check_routability(&PathBuf::from(target_home)))
 }
@@ -596,6 +631,8 @@ fn main() {
             undo_last,
             list_rollback_ledgers,
             check_routability,
+            list_sessions,
+            migrate_sessions,
             fix_presets_now,
             switch_preflight,
             watch_check,

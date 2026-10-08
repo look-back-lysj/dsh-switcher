@@ -144,7 +144,7 @@ pub fn collect_credential_refs(target_home: &Path) -> Vec<String> {
 }
 
 /// 会话目录里取"数值最高的规范代"会话文件（官方读取规则）。
-fn newest_session_file(session_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn newest_session_file(session_dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(u32, PathBuf)> = None;
     for entry in fs::read_dir(session_dir).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -167,7 +167,7 @@ fn newest_session_file(session_dir: &Path) -> Option<PathBuf> {
 
 /// 解压整条会话（多帧拼接），抽出 JSONL 行。
 /// 会话通常几十~几百 KB 解压后，逐行扫 model/selection 代价可忽略。
-fn decompress_session(path: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn decompress_session(path: &Path) -> Result<Vec<String>, String> {
     let bytes = fs::read(path).map_err(|e| format!("读取会话失败：{e}"))?;
     let (frames, _torn) = crate::zstd_check::scan_frames(&bytes)?;
     let mut lines = Vec::new();
@@ -192,7 +192,7 @@ fn frame_start(f: &crate::zstd_check::FrameRange) -> usize { f.start() }
 fn frame_end(f: &crate::zstd_check::FrameRange) -> usize { f.end() }
 
 /// 从会话行里提取：header 的 id/cwd + 最后一条 model/selection + 附件引用数
-fn analyze_session_lines(lines: &[String]) -> (Option<String>, Option<String>, Option<String>, u32, Option<String>) {
+pub(crate) fn analyze_session_lines(lines: &[String]) -> (Option<String>, Option<String>, Option<String>, u32, Option<String>) {
     let mut id = None;
     let mut cwd = None;
     let mut last_route: Option<String> = None;
@@ -240,7 +240,7 @@ fn analyze_session_lines(lines: &[String]) -> (Option<String>, Option<String>, O
 }
 
 /// 归档名单：storages/workspace.json 的 global.archivedSessionIds
-fn archived_ids(target_home: &Path) -> HashSet<String> {
+pub(crate) fn archived_ids(target_home: &Path) -> HashSet<String> {
     let file = target_home.join("storages").join("workspace.json");
     let Ok(text) = fs::read_to_string(&file) else { return HashSet::new() };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return HashSet::new() };

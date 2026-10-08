@@ -254,7 +254,7 @@ fn now_string() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
-fn home_id_of(path: &Path) -> String {
+pub(crate) fn home_id_of(path: &Path) -> String {
     let normalized = path.to_string_lossy().to_lowercase();
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
@@ -265,7 +265,7 @@ fn home_id_of(path: &Path) -> String {
 /// 检测 DSH 是否在运行（Windows ToolHelp32 进程快照）。
 /// 返回运行中的 DSH 进程名列表（空 = 未运行）。
 #[cfg(windows)]
-pub fn detect_dsh_processes() -> Vec<String> {
+pub(crate) fn detect_dsh_processes() -> Vec<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -303,7 +303,7 @@ pub fn detect_dsh_processes() -> Vec<String> {
 }
 
 #[cfg(not(windows))]
-pub fn detect_dsh_processes() -> Vec<String> {
+pub(crate) fn detect_dsh_processes() -> Vec<String> {
     Vec::new()
 }
 
@@ -424,7 +424,7 @@ fn move_dir_with_progress(src: &Path, dst: &Path, app: Option<&tauri::AppHandle>
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     copy_dir_progress(src, dst, None, &mut 0, 0)
 }
 
@@ -463,7 +463,7 @@ fn count_files(root: &Path) -> u64 {
     n
 }
 
-fn repo_files_dir(repo: &Path, home_id: &str) -> PathBuf {
+pub(crate) fn repo_files_dir(repo: &Path, home_id: &str) -> PathBuf {
     repo.join("adopted").join(home_id).join("files")
 }
 
