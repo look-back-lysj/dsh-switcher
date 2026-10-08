@@ -1393,6 +1393,9 @@ async function doSwitch() {
     showResult($('switch-result'), msg, false);
     // v4.2 模块A：切换后自动做"可路由性体检"，告诉用户每条对话能不能直接继续聊
     renderRouteCheck(state.switchTarget);
+    // v4.2 模块F：显示「后悔药」回滚条
+    const rbBar = $('rollback-bar');
+    if (rbBar) { rbBar.hidden = false; rbBar.dataset.snapshot = result.backupSnapshot; rbBar.dataset.target = state.switchTarget; }
     await renderSwitch();
     updateSwitchRoute();
     backgroundRescan(); // 切换后后台刷新缓存
@@ -1426,6 +1429,40 @@ async function doSyncNew(homePath) {
     showResult($('env-result'), `「${label}」的新内容已收录进仓库。`, false);
   } catch (e) {
     alert(`收录失败：${e.message || e}`);
+  }
+}
+
+// v4.2 模块F：一键回滚到切换前。
+async function doRollbackSwitch() {
+  const bar = $('rollback-bar');
+  if (!bar || !bar.dataset.snapshot) return;
+  const target = bar.dataset.target;
+  const snapshot = bar.dataset.snapshot;
+  const home = state.homes.find(h => h.path === target);
+  const ok = await confirmDialog({
+    title: '回滚到切换前',
+    message: `将把「${home ? home.label : target}」恢复到切换「${snapshot}」之前的样子。`,
+    items: [
+      '当前内容会先再存一份自保快照，不会丢。',
+      '凭据（API Key / 登录态）不受回滚影响。',
+      '请确认所有 DSH 窗口已关闭。',
+    ],
+    confirmText: '确认回滚',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await withOpProgress('正在回滚', () => invoke('rollback_switch', {
+      repo: state.defaultRepo,
+      targetHome: target,
+      snapshotName: snapshot,
+    }));
+    bar.hidden = true;
+    showResult($('switch-result'), `已回滚：「${home ? home.label : target}」恢复到了切换前的样子。`, false);
+    const rc = $('routecheck-card'); if (rc) rc.hidden = true;
+    backgroundRescan();
+  } catch (e) {
+    showResult($('switch-result'), `回滚失败：${e.message || e}`, true);
   }
 }
 
@@ -1516,6 +1553,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   refreshWatch(); // v4.2 模块D：启动比对已接管环境指纹，有变化显示角标
   setupOpProgressListener();
   $('rescan').addEventListener('click', scan);
+  const rbBtn = $('rollback-switch');
+  if (rbBtn) rbBtn.addEventListener('click', doRollbackSwitch);
   $('pick-backup-repo').addEventListener('click', async () => {
     const path = await selectDirectory('选择备份仓库');
     if (path) $('backup-repo').value = path;

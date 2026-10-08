@@ -222,6 +222,20 @@ input[type="text"]:hover, select:hover { border-color: #d1d5db; }
 }
 .result.error { border-color: #fecaca; background: var(--color-danger-bg); color: var(--color-danger); }
 
+/* v4.2 模块F：回滚条 */
+.rollback-bar {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px dashed var(--color-hairline);
+  border-radius: var(--radius-control);
+  background: #fffdf7;
+}
+.rollback-hint { font-size: 12.5px; color: var(--color-ink-secondary); }
+
 /* v4.2 模块D：「有变化」角标（克制的小药丸，非 pill 按钮，仅作状态指示） */
 .watch-badge {
   display: inline-block;

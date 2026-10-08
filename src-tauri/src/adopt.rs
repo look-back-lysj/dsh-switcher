@@ -815,6 +815,107 @@ pub struct SwitchResult {
     pub settings_copied: bool,
 }
 
+/// v4.2 模块F：一键回滚到"切换前"。
+/// 把最近一次保险快照的内容写回目标端自己的存档（链接不动），凭据文件硬跳过。
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchSnapshotInfo {
+    pub name: String,
+    pub time: String,
+    pub from_label: String,
+    pub file_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackResult {
+    pub restored_dirs: u32,
+    pub restored_settings: bool,
+    pub snapshot: String,
+    pub warnings: Vec<String>,
+}
+
+/// 列出某目标环境的切换保险快照（新→旧）。
+pub fn list_switch_snapshots(repo: &Path, target_home: &Path) -> Vec<SwitchSnapshotInfo> {
+    let tgt_id = home_id_of(target_home);
+    let index_file = repo.join("switch-backups").join(&tgt_id).join("index.json");
+    let mut out = Vec::new();
+    if let Ok(text) = fs::read_to_string(&index_file) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(arr) = v.get("snapshots").and_then(|a| a.as_array()) {
+                for s in arr.iter().rev() {
+                    out.push(SwitchSnapshotInfo {
+                        name: s.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        time: s.get("time").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        from_label: s.get("fromLabel").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        file_count: s.get("fileCount").and_then(|x| x.as_u64()).unwrap_or(0),
+                    });
+                }
+            }
+        }
+    }
+    out.retain(|s| !s.name.is_empty());
+    out
+}
+
+/// 回滚：把指定保险快照写回目标端。
+/// 安全：先给当前目标端做一份"回滚前自保"快照；凭据文件绝不写。
+pub fn rollback_switch(repo: &Path, target_home: &Path, snapshot_name: &str) -> Result<RollbackResult, String> {
+    let running = detect_dsh_processes();
+    if !running.is_empty() {
+        return Err(format!("检测到 DSH 正在运行（{}），请先关闭再回滚。", running.join(", ")));
+    }
+    if read_adopt_record(repo, target_home).is_none() {
+        return Err("目标环境未接管，无法回滚。".to_string());
+    }
+    let tgt_id = home_id_of(target_home);
+    let tgt_files = repo_files_dir(repo, &tgt_id);
+    let snap_root = repo.join("switch-backups").join(&tgt_id).join(snapshot_name);
+    if !snap_root.is_dir() {
+        return Err(format!("保险快照不存在：{snapshot_name}"));
+    }
+
+    // 1. 回滚前自保：把目标端当前内容存一份，防回滚错方向。
+    let self_snap = repo.join("switch-backups").join(&tgt_id)
+        .join(format!("{}-回滚前自保", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    for dir in ["sessions", "skills", ".agent-presets", "guard", "storages", "rollbacks", "undo-snapshots", "memories", "team"] {
+        let store = tgt_files.join(dir);
+        if store.is_dir() {
+            copy_dir_recursive(&store, &self_snap.join(dir)).map_err(|e| format!("回滚前自保失败：{e}"))?;
+        }
+    }
+
+    // 2. 把快照里的 9 类目录写回目标端存档（镜像：先清再写）
+    let mut restored = 0u32;
+    let mut warnings = Vec::new();
+    for dir in ["sessions", "skills", ".agent-presets", "guard", "storages", "rollbacks", "undo-snapshots", "memories", "team"] {
+        let src = snap_root.join(dir);
+        if !src.is_dir() { continue; }
+        let dst = tgt_files.join(dir);
+        if dst.is_dir() {
+            fs::remove_dir_all(&dst).map_err(|e| format!("清理目标 {dir} 失败：{e}"))?;
+        }
+        copy_dir_recursive(&src, &dst).map_err(|e| format!("回滚 {dir} 失败：{e}"))?;
+        restored += 1;
+    }
+
+    // 3. settings.yaml：快照里存的是 home-settings.yaml，写回 home 根
+    let mut restored_settings = false;
+    let snap_settings = snap_root.join("home-settings.yaml");
+    if snap_settings.is_file() {
+        let dst = target_home.join("settings.yaml");
+        fs::copy(&snap_settings, &dst).map_err(|e| format!("回滚 settings.yaml 失败：{e}"))?;
+        restored_settings = true;
+    }
+    // 凭据文件永远不在保险快照里，也绝不写——明示
+    warnings.push("凭据（API Key / 登录态）不在回滚范围，保持你当前的登录不受影响。".to_string());
+    if restored == 0 && !restored_settings {
+        return Err("保险快照里没有可回滚的内容。".to_string());
+    }
+    Ok(RollbackResult { restored_dirs: restored, restored_settings, snapshot: snapshot_name.to_string(), warnings })
+}
+
 /// v4.2 模块D：动态跟随的变化指纹。
 /// 只扫 sessions / skills 两个动态目录，取"文件数 + 最新 mtime（毫秒）"，
 /// 不哈希、不解压，毫秒级完成，供启动时快速比对"有没有新东西"。
@@ -1990,6 +2091,43 @@ mod tests {
         let rec3 = after_new.iter().find(|c| c.home == home.to_string_lossy()).unwrap();
         assert!(rec3.changed, "新增对话后应报变化");
         assert!(rec3.new_sessions >= 1, "应识别出新增对话数: {}", rec3.new_sessions);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn e2e_rollback_switch() {
+        // 模块F：切换后回滚 → 目标端恢复到自己原来的内容
+        let base = std::env::temp_dir().join(format!("dsh-vault-rollback-{}", std::process::id()));
+        let repo = base.join("repo");
+        let home_a = base.join("homeA");
+        fs::create_dir_all(home_a.join("sessions").join("pA").join("s1")).unwrap();
+        fs::write(home_a.join("sessions").join("pA").join("s1").join("session.jsonl.zstd"), b"A-data").unwrap();
+        fs::write(home_a.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        let home_b = base.join("homeB");
+        fs::create_dir_all(home_b.join("sessions").join("pB").join("s2")).unwrap();
+        fs::write(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd"), b"B-data").unwrap();
+        fs::write(home_b.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        adopt_home(&repo, &home_a, "A").unwrap();
+        adopt_home(&repo, &home_b, "B").unwrap();
+
+        // 切换 A → B
+        let sw = switch_links(&repo, &home_a, &home_b, true, false, false, false, false).unwrap();
+        // 确认 B 现在是 A 的内容
+        assert_eq!(fs::read(home_b.join("sessions").join("pA").join("s1").join("session.jsonl.zstd")).unwrap(), b"A-data");
+
+        // 列出保险快照
+        let snaps = list_switch_snapshots(&repo, &home_b);
+        assert!(!snaps.is_empty(), "应有保险快照");
+
+        // 回滚
+        let rb = rollback_switch(&repo, &home_b, &sw.backup_snapshot).unwrap();
+        assert!(rb.restored_dirs >= 1);
+        // B 恢复成自己的内容
+        assert_eq!(fs::read(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd")).unwrap(), b"B-data");
+        // A 的内容不在了（被回滚覆盖）
+        assert!(!home_b.join("sessions").join("pA").exists(), "回滚后不应再有 A 的会话");
 
         let _ = fs::remove_dir_all(&base);
     }

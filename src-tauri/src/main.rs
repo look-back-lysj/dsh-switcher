@@ -375,6 +375,27 @@ async fn switch_links(
     result
 }
 #[tauri::command]
+fn list_switch_snapshots(repo: String, target_home: String) -> Vec<adopt::SwitchSnapshotInfo> {
+    adopt::list_switch_snapshots(&PathBuf::from(repo), &PathBuf::from(target_home))
+}
+
+#[tauri::command]
+async fn rollback_switch(repo: String, target_home: String, snapshot_name: String) -> Result<adopt::RollbackResult, String> {
+    let repo_log = repo.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        adopt::rollback_switch(&PathBuf::from(repo), &PathBuf::from(target_home), &snapshot_name)
+    })
+    .await
+    .map_err(|e| format!("回滚任务中断：{e}"))?;
+    match &result {
+        Ok(r) => oplog::record("rollback", &repo_log, &r.snapshot,
+            &format!("回滚 {} 类内容{}", r.restored_dirs, if r.restored_settings { "（含 settings.yaml）" } else { "" }), "ok", ""),
+        Err(e) => oplog::record("rollback", &repo_log, "", "", "fail", &e.chars().take(200).collect::<String>()),
+    }
+    result
+}
+
+#[tauri::command]
 fn watch_check(repo: String) -> Vec<adopt::WatchChange> {
     adopt::watch_check(&PathBuf::from(repo))
 }
@@ -567,6 +588,8 @@ fn main() {
             switch_preflight,
             watch_check,
             watch_mark_synced,
+            list_switch_snapshots,
+            rollback_switch,
             preview_rollback_compensate,
             apply_rollback_compensate,
             export_backup,
