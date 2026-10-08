@@ -1355,6 +1355,9 @@ async function doSwitch() {
     if (result.credentialNote) {
       msg += `\n\n提醒：API Key 没有随切换迁移（密钥环保护，安全设计）。如果「${t?.label}」发不出消息，打开它的设置 → 凭据，重新录入一次 API Key 即可。`;
     }
+    if (result.warnings && result.warnings.length) {
+      msg += `\n\n${result.warnings.join('\n')}`;
+    }
     showResult($('switch-result'), msg, false);
     await renderSwitch();
     updateSwitchRoute();

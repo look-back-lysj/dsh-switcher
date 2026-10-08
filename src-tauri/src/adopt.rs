@@ -928,6 +928,28 @@ pub fn switch_links(
         warnings.push("凭据（API Key）不会随切换迁移。若目标环境发不出消息，请在该版本设置里重新录入 API Key。".to_string());
     }
 
+    // v4.1 模块④：skills 路径差异提示。
+    // 同学排查报告 03.4 已证实：官方版实际用 ~/.agents\skills（共享库），
+    // 而被接管/切换的是 <home>\skills，两套路径不一致会导致「切了 skills 但在官方版里看不到」。
+    if include_skills {
+        let agents_root = std::env::var_os("DSH_AGENTS_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".agents")
+            });
+        let agents_skills = agents_root.join("skills");
+        let tgt_skills = target_home.join("skills");
+        if agents_skills.is_dir() && tgt_skills.is_dir() {
+            warnings.push(format!(
+                "提示：本机存在共享技能库 {}。部分版本（如官方版）的技能从这里读取，而不是从本环境的 skills 目录。若切换后技能未生效，可在「环境」页把共享技能库也接管。",
+                agents_skills.display()
+            ));
+        }
+    }
+
     Ok(SwitchResult {
         switched_links: switched,
         backup_snapshot: snap_name,
