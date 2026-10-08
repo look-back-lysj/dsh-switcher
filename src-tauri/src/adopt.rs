@@ -815,6 +815,104 @@ pub struct SwitchResult {
     pub settings_copied: bool,
 }
 
+/// v4.2 模块D：动态跟随的变化指纹。
+/// 只扫 sessions / skills 两个动态目录，取"文件数 + 最新 mtime（毫秒）"，
+/// 不哈希、不解压，毫秒级完成，供启动时快速比对"有没有新东西"。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchFingerprint {
+    pub sessions_files: u64,
+    pub sessions_latest_ms: u64,
+    pub skills_files: u64,
+    pub skills_latest_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchChange {
+    pub home: String,
+    pub label: String,
+    pub changed: bool,
+    pub new_sessions: i64,
+    pub new_skills: i64,
+    pub fingerprint: WatchFingerprint,
+}
+
+fn dir_fingerprint(root: &Path) -> (u64, u64) {
+    if !root.is_dir() {
+        return (0, 0);
+    }
+    let mut count = 0u64;
+    let mut latest = 0u64;
+    for entry in walkdir::WalkDir::new(root).follow_links(true).into_iter().filter_map(Result::ok).take(5000) {
+        if !entry.file_type().is_file() { continue; }
+        count += 1;
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(m) = meta.modified() {
+                if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                    latest = latest.max(d.as_millis() as u64);
+                }
+            }
+        }
+    }
+    (count, latest)
+}
+
+pub fn watch_fingerprint(home: &Path) -> WatchFingerprint {
+    let (sf, sm) = dir_fingerprint(&home.join("sessions"));
+    let (kf, km) = dir_fingerprint(&home.join("skills"));
+    WatchFingerprint { sessions_files: sf, sessions_latest_ms: sm, skills_files: kf, skills_latest_ms: km }
+}
+
+/// 对比当前指纹与仓库里记录的指纹（存在 adopted 记录旁）。
+/// 返回每个已接管环境的变化情况。
+pub fn watch_check(repo: &Path) -> Vec<WatchChange> {
+    let mut out = Vec::new();
+    let adopted_root = repo.join("adopted");
+    if !adopted_root.is_dir() { return out; }
+    for entry in fs::read_dir(&adopted_root).into_iter().flatten().flatten() {
+        let record_file = entry.path().join("record.json");
+        let Ok(text) = fs::read_to_string(&record_file) else { continue };
+        let Ok(record) = serde_json::from_str::<AdoptRecord>(&text) else { continue };
+        let home = PathBuf::from(&record.home_path);
+        if !home.is_dir() { continue; }
+        let label = home.file_name().and_then(|v| v.to_str()).unwrap_or("环境").to_string();
+        let current = watch_fingerprint(&home);
+        let saved = read_watch_fingerprint(repo, &record.home_path);
+        let changed = saved.as_ref().map(|s| *s != current).unwrap_or(true);
+        let (ns, nk) = saved.as_ref().map(|s| {
+            (current.sessions_files as i64 - s.sessions_files as i64,
+             current.skills_files as i64 - s.skills_files as i64)
+        }).unwrap_or((0, 0));
+        out.push(WatchChange {
+            home: record.home_path.clone(),
+            label,
+            changed,
+            new_sessions: ns,
+            new_skills: nk,
+            fingerprint: current,
+        });
+    }
+    out
+}
+
+/// 收录完成后，把当前指纹写回（下次比对基准）。
+pub fn watch_mark_synced(repo: &Path, home: &Path) -> Result<(), String> {
+    let fp = watch_fingerprint(home);
+    let id = home_id_of(home);
+    let file = repo.join("adopted").join(&id).join("watch.json");
+    let text = serde_json::to_string(&fp).map_err(|e| format!("指纹序列化失败：{e}"))?;
+    fs::write(&file, text).map_err(|e| format!("指纹写入失败：{e}"))?;
+    Ok(())
+}
+
+fn read_watch_fingerprint(repo: &Path, home: &str) -> Option<WatchFingerprint> {
+    let id = home_id_of(Path::new(home));
+    let file = repo.join("adopted").join(&id).join("watch.json");
+    let text = fs::read_to_string(&file).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// v4.2 模块C：切换前预检（只读，不写任何东西）。
 /// 给前端在弹确认框前拿到"风险清单"，让用户知情后再点确认。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1858,6 +1956,40 @@ mod tests {
         assert_eq!(pf.target_only_sessions, 1, "目标多 1 条会话");
         assert!(pf.notices.iter().any(|n| n.contains("settings.yaml")), "应提示带配置");
         assert!(pf.notices.iter().any(|n| n.contains("替换")), "应提示镜像语义");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn e2e_watch_change_detection() {
+        // 模块D：接管后新增对话/技能 → watch_check 应报 changed；收录写指纹后 → changed 消失
+        let base = std::env::temp_dir().join(format!("dsh-vault-watch-{}", std::process::id()));
+        let repo = base.join("repo");
+        let home = base.join("home");
+        fs::create_dir_all(home.join("sessions").join("p").join("s1")).unwrap();
+        fs::write(home.join("sessions").join("p").join("s1").join("session.jsonl.zstd"), b"x").unwrap();
+        fs::write(home.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        adopt_home(&repo, &home, "w").unwrap();
+
+        // 初始：无指纹基准 → changed=true（首次）
+        let before = watch_check(&repo);
+        let rec = before.iter().find(|c| c.home == home.to_string_lossy()).expect("应有该 home");
+        assert!(rec.changed, "首次无基准，应视为有变化");
+
+        // 收录：写入指纹基准
+        watch_mark_synced(&repo, &home).unwrap();
+        let after_sync = watch_check(&repo);
+        let rec2 = after_sync.iter().find(|c| c.home == home.to_string_lossy()).unwrap();
+        assert!(!rec2.changed, "收录后指纹一致，不应再报变化");
+
+        // 新增一条对话 → 又应报变化，且 new_sessions >= 1
+        fs::create_dir_all(home.join("sessions").join("p").join("s2")).unwrap();
+        fs::write(home.join("sessions").join("p").join("s2").join("session.jsonl.zstd"), b"y").unwrap();
+        let after_new = watch_check(&repo);
+        let rec3 = after_new.iter().find(|c| c.home == home.to_string_lossy()).unwrap();
+        assert!(rec3.changed, "新增对话后应报变化");
+        assert!(rec3.new_sessions >= 1, "应识别出新增对话数: {}", rec3.new_sessions);
 
         let _ = fs::remove_dir_all(&base);
     }

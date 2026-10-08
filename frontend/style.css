@@ -222,6 +222,21 @@ input[type="text"]:hover, select:hover { border-color: #d1d5db; }
 }
 .result.error { border-color: #fecaca; background: var(--color-danger-bg); color: var(--color-danger); }
 
+/* v4.2 模块D：「有变化」角标（克制的小药丸，非 pill 按钮，仅作状态指示） */
+.watch-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #b45309;
+  background: #fef6e7;
+  border: 1px solid #f3d9a4;
+  border-radius: 4px;
+  vertical-align: middle;
+  cursor: default;
+}
+
 /* ===== v4.2 对话可用性体检卡片（浅色克制风，呼应 .result） ===== */
 .routecheck-card {
   margin-top: 12px;

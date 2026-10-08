@@ -1,5 +1,6 @@
 const state = {
   homes: [],
+  watchChanges: {},
   defaultRepo: '',
   manifest: null,
   preview: null,
@@ -927,7 +928,17 @@ function adoptBadge(home) {
 }
 
 // 环境页卡片渲染（覆盖原 renderHealth 的 home-list 部分）
+let __watchLoadedOnce = false;
 function renderEnvironment() {
+  // v4.2 模块D：首次进入环境页时拉一次变化指纹，拉到后重渲以显示「有变化」角标。
+  // 指纹比对是毫秒级，不影响渲染流畅度。
+  if (!__watchLoadedOnce) {
+    __watchLoadedOnce = true;
+    refreshWatch().then(() => {
+      const envView = document.querySelector('.nav-item[data-view="environment"].is-active');
+      if (envView) renderEnvironment();
+    });
+  }
   renderHealth(); // 复用统计区
   // 渲染接管状态到每张卡片
   document.querySelectorAll('#home-list .home-row').forEach((row, idx) => {
@@ -940,9 +951,14 @@ function renderEnvironment() {
     const isDsh = home.kind === 'dsh-home';
     const missing = !!home.__missing;
     const adopted = !missing && state.adoptStatus[home.path]?.adopted;
+    const watchInfo = state.watchChanges && state.watchChanges[home.path];
+    const watchBadge = (adopted && watchInfo && watchInfo.changed)
+      ? `<span class="watch-badge" title="对话/技能有变动，点「收录」把新内容收进仓库">有变化</span>` : '';
+    const syncBtn = (adopted)
+      ? `<button class="button compact primary" data-sync="${escapeHtml(home.path)}">收录新内容</button>` : '';
     const btn = isDsh && !missing
       ? (adopted
-          ? `<button class="button compact" data-unadopt="${escapeHtml(home.path)}">断开接管</button>`
+          ? `${syncBtn}<button class="button compact" data-unadopt="${escapeHtml(home.path)}">断开接管</button>`
           : `<button class="button compact primary" data-adopt="${escapeHtml(home.path)}">一键接管</button>`)
       : (missing ? `<span class="badge muted">已消失</span>` : '');
     return `
@@ -957,7 +973,7 @@ function renderEnvironment() {
         </div>
         <div class="home-badges">
           <span class="badge ${tone}">${label}</span>
-          <span class="badge ${atone}">${alabel}</span>
+          <span class="badge ${atone}">${alabel}</span>${watchBadge}
         </div>
         <div class="home-actions">${btn}</div>
       </article>
@@ -1387,6 +1403,32 @@ async function doSwitch() {
   }
 }
 
+// v4.2 模块D：动态跟随。启动/刷新时比对每个已接管环境的对话与技能指纹。
+async function refreshWatch() {
+  try {
+    const changes = await invoke('watch_check', { repo: state.defaultRepo });
+    state.watchChanges = {};
+    (changes || []).forEach(c => { state.watchChanges[c.home] = c; });
+  } catch (e) { state.watchChanges = {}; }
+}
+
+// 一键收录：把该环境的新对话/新技能收进仓库（增量备份），收录后更新指纹基准。
+async function doSyncNew(homePath) {
+  const home = state.homes.find(h => h.path === homePath);
+  const label = home ? home.label : homePath;
+  try {
+    await withOpProgress(`正在收录「${label}」的新内容`, async () => {
+      await invoke('backup', { repo: state.defaultRepo, note: `收录新内容-${label}`, onlyConfig: false });
+      await invoke('watch_mark_synced', { repo: state.defaultRepo, homePath });
+    });
+    await refreshWatch();
+    await renderEnvironment();
+    showResult($('env-result'), `「${label}」的新内容已收录进仓库。`, false);
+  } catch (e) {
+    alert(`收录失败：${e.message || e}`);
+  }
+}
+
 // v4.2 模块A：切换后体检。逐条会话判定"能不能直接继续聊"，结果以待办卡片呈现。
 async function renderRouteCheck(targetHome) {
   const card = $('routecheck-card');
@@ -1471,6 +1513,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   } catch (e) {}
   // 先秒读缓存显示上次结果，再触发 scan() 后台刷新（见文件末尾）
   await loadScanCache();
+  refreshWatch(); // v4.2 模块D：启动比对已接管环境指纹，有变化显示角标
   setupOpProgressListener();
   $('rescan').addEventListener('click', scan);
   $('pick-backup-repo').addEventListener('click', async () => {
@@ -1572,6 +1615,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const unadoptBtn = e.target.closest('[data-unadopt]');
     if (adoptBtn) doAdopt(adoptBtn.dataset.adopt);
     if (unadoptBtn) doUnadopt(unadoptBtn.dataset.unadopt);
+    const syncBtn = e.target.closest('[data-sync]');
+    if (syncBtn) doSyncNew(syncBtn.dataset.sync);
   });
   // 高级操作 → 恢复视图
   $('open-advanced')?.addEventListener('click', () => showView('restore'));

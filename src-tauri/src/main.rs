@@ -375,6 +375,16 @@ async fn switch_links(
     result
 }
 #[tauri::command]
+fn watch_check(repo: String) -> Vec<adopt::WatchChange> {
+    adopt::watch_check(&PathBuf::from(repo))
+}
+
+#[tauri::command]
+fn watch_mark_synced(repo: String, home_path: String) -> Result<(), String> {
+    adopt::watch_mark_synced(&PathBuf::from(repo), &PathBuf::from(home_path))
+}
+
+#[tauri::command]
 fn switch_preflight(repo: String, source_home: String, target_home: String) -> Result<adopt::SwitchPreflight, String> {
     Ok(adopt::switch_preflight(
         &PathBuf::from(repo),
@@ -555,6 +565,8 @@ fn main() {
             list_rollback_ledgers,
             check_routability,
             switch_preflight,
+            watch_check,
+            watch_mark_synced,
             preview_rollback_compensate,
             apply_rollback_compensate,
             export_backup,
