@@ -14,6 +14,7 @@ use repo::{default_repo, load_manifest, run_backup, RestoreMode, RestoreScope};
 use restore::{preview_restore as preview_restore_impl, run_restore as run_restore_impl, undo_last as undo_last_impl};
 use serde::Serialize;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,10 +117,12 @@ fn import_backup(archive: String, repo: String) -> Result<export::ImportResult, 
 // ===================== v3：接管 / 切换 / 深度扫描 =====================
 
 #[tauri::command]
-async fn deep_scan(deep: bool) -> ScanResult {
-    // 多算法融合扫描放进阻塞线程池，避免遍历目录时冻结 IPC/WebView。
+async fn deep_scan(deep: bool, cancel: tauri::State<'_, CancellationToken>) -> Result<ScanResult, String> {
+    // 新扫描前重置取消令牌，供本次扫描使用
+    let token = cancel.inner().clone();
+    // 多算法融合扫描放进阻塞线程池，避免遍历目录时冻结 IPC/WebView；可被 cancel_operation 中断。
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let mut homes = multiscan::multi_scan(!deep);
+        let mut homes = multiscan::multi_scan_cancellable(!deep, Some(&token));
         if let Some(agents) = scanner::discover_agents_home() {
             homes.push(agents);
         }
@@ -132,7 +135,12 @@ async fn deep_scan(deep: bool) -> ScanResult {
     .unwrap_or_else(|_| ScanResult { homes: Vec::new(), default_repo: default_repo() });
     // 记录扫描结果：deep 记 "deep"，quick 记 "quick"，失败不阻断返回
     let _ = scan_cache::save(&result.homes, if deep { "deep" } else { "quick" });
-    result
+    Ok(result)
+}
+
+#[tauri::command]
+fn cancel_operation(cancel: tauri::State<'_, CancellationToken>) {
+    cancel.inner().cancel();
 }
 
 #[tauri::command]
@@ -430,6 +438,7 @@ fn main() {
     let context = tauri::generate_context!();
     let cdp_port = std::env::var("DSH_VAULT_CDP_PORT").ok().filter(|v| !v.trim().is_empty());
     tauri::Builder::default()
+        .manage(CancellationToken::new())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             scan_homes,
@@ -458,7 +467,8 @@ fn main() {
             repair_partial,
             load_scan_cache,
             clear_scan_cache,
-            check_link_capability
+            check_link_capability,
+            cancel_operation
         ])
         .setup(move |app| {
             let mut builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())

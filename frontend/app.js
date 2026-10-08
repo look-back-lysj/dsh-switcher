@@ -1019,7 +1019,9 @@ async function doUnadopt(homePath) {
 
 async function deepScan() {
   const btn = $('deep-scan');
+  const cancelBtn = $('cancel-scan');
   setBusy(btn, true, '深度扫描中…');
+  if (cancelBtn) cancelBtn.hidden = false;
   try {
     const result = await invoke('deep_scan', { deep: true });
     state.homes = result.homes;
@@ -1036,6 +1038,7 @@ async function deepScan() {
     showResult($('env-result'), `深度扫描失败：${e.message}`, true);
   } finally {
     setBusy(btn, false);
+    if (cancelBtn) cancelBtn.hidden = true;
   }
 }
 
@@ -1343,6 +1346,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // v3：环境页
   $('deep-scan').addEventListener('click', deepScan);
+  $('cancel-scan')?.addEventListener('click', async () => {
+    try { await invoke('cancel_operation'); } catch (e) {}
+  });
   $('repair-all').addEventListener('click', repairAll);
   $('copy-mcp-config')?.addEventListener('click', async () => {
     const text = $('mcp-config-text')?.textContent || '';

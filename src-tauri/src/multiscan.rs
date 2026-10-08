@@ -247,6 +247,14 @@ fn should_skip_dir(name: &str) -> bool {
 /// quick=true：只扫常见根（用户目录、AppData、各盘根直下），深度 3，快。
 /// quick=false：全盘所有固定盘，深度 5，慢但全。
 pub fn multi_scan(quick: bool) -> Vec<DiscoveredHome> {
+    multi_scan_cancellable(quick, None)
+}
+
+/// 带取消令牌的多算法扫描。token 置位时在遍历/评分阶段安全提前返回已发现结果。
+pub fn multi_scan_cancellable(quick: bool, cancel: Option<&tokio_util::sync::CancellationToken>) -> Vec<DiscoveredHome> {
+    let cancelled = |cancel: Option<&tokio_util::sync::CancellationToken>| -> bool {
+        cancel.map(|t| t.is_cancelled()).unwrap_or(false)
+    };
     let mut homes: Vec<DiscoveredHome> = Vec::new();
     let mut seen_real: HashSet<String> = HashSet::new();
     let deadline = std::time::Instant::now()
@@ -320,7 +328,7 @@ pub fn multi_scan(quick: bool) -> Vec<DiscoveredHome> {
             })
             .filter_map(Result::ok)
         {
-            if std::time::Instant::now() > deadline {
+            if std::time::Instant::now() > deadline || cancelled(cancel) {
                 break;
             }
             if !entry.file_type().is_dir() {
@@ -332,6 +340,9 @@ pub fn multi_scan(quick: bool) -> Vec<DiscoveredHome> {
 
     // 融合评分
     for cand in candidates {
+        if cancelled(cancel) {
+            break;
+        }
         // junction/symlink 去重
         let real = fs::canonicalize(&cand).unwrap_or_else(|_| cand.clone());
         let key = real.to_string_lossy().to_lowercase().replace('\\', "/");

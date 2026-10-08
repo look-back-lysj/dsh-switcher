@@ -702,6 +702,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "thiserror 2.0.21",
+ "tokio-util",
  "uuid",
  "walkdir",
  "windows-sys 0.61.2",
