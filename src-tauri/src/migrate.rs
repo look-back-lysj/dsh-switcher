@@ -27,6 +27,7 @@ pub struct SessionEntry {
     pub parent: Option<String>,
     pub preset: Option<String>,
     pub generation: u32,
+    pub created_at_ms: u64,
 }
 
 /// 前端多选列表用的会话视图（PathBuf → String，附标题线索）
@@ -103,6 +104,7 @@ fn parse_session_entry(dir: &Path, file: &Path) -> SessionEntry {
     let mut parent = None;
     let mut preset = None;
     let mut generation = 0u32;
+    let mut created_at_ms = 0u64;
     // 代次从文件名取
     let fname = file.file_name().and_then(|v| v.to_str()).unwrap_or("");
     generation = if fname == "session.jsonl.zstd" { 0 } else {
@@ -117,6 +119,7 @@ fn parse_session_entry(dir: &Path, file: &Path) -> SessionEntry {
                     if let Some(line) = text.lines().next() {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                             if let Some(i) = v.get("id").and_then(|x| x.as_str()) { id = i.to_string(); }
+                            if let Some(ca) = v.get("createdAt").and_then(|x| x.as_u64()) { created_at_ms = ca; }
                             cwd = v.get("cwd").and_then(|x| x.as_str()).map(String::from);
                             parent = v.get("parentSession").and_then(|x| x.as_str()).map(String::from);
                             preset = v.get("agentPreset").and_then(|x| x.as_str()).map(String::from);
@@ -127,7 +130,7 @@ fn parse_session_entry(dir: &Path, file: &Path) -> SessionEntry {
             }
         }
     }
-    SessionEntry { id, dir: dir.to_path_buf(), file: file.to_path_buf(), cwd, parent, preset, generation }
+    SessionEntry { id, dir: dir.to_path_buf(), file: file.to_path_buf(), cwd, parent, preset, generation, created_at_ms }
 }
 
 /// 血缘收集：把请求的若干 id 扩展成"各自连同全部子孙"的完整集合。
@@ -242,49 +245,145 @@ fn target_has_session(target_home: &Path, id: &str) -> bool {
 
 /// 往目标 workspace.json 的对应工作区 sessionIds 追加（无该工作区则新建条目）。
 /// 工作区按 cwd 匹配：workspace 条目里若有与 cwd 对应的项则用之，否则新建。
+/// 迁移后为会话补建"最小合法"投影缓存记录（session_projcache）。
+///
+/// 为什么必须做（本次"只看见项目看不见对话"事故的根因）：
+///   官方版不会主动给磁盘上"突然出现"的会话建缓存——缓存只在它自己创建/打开会话时写。
+///   而对话列表（session.list）读的是 session_projcache 这个缓存域。
+///   只放会话文件 + 改 workspace.json，缓存里没有记录 → 列表里看不见。
+///
+/// 安全依据（官方 asar 实证）：
+///   - checkpointRecord schema = { identity, rows: Record<string,row> }，rows 可为空对象。
+///   - checkpointIdentity 只有 createdAt 必填，其余（formatVersion/cwd/isSeeded/inheritedEventCount）全 optional。
+///   - 官方明说："a stale or unreadable cache costs a longer tail replay, never a wrong value"。
+///   所以写 { identity, rows:{} } 的最小记录是安全的：官方把它当 uncached，打开时冷读重建真实 rows。
+fn write_minimal_projection_cache(
+    target_home: &Path,
+    session_id: &str,
+    created_at_ms: u64,
+    cwd: &str,
+    format_version: u32,
+) -> Result<(), String> {
+    let dir = target_home.join("storages").join("session_projcache").join("sessions");
+    fs::create_dir_all(&dir).map_err(|e| format!("建 projcache 目录失败：{e}"))?;
+    let file = dir.join(format!("{}.json", session_id));
+    // 已有缓存记录就不覆盖（官方自己建的更完整）
+    if file.is_file() {
+        return Ok(());
+    }
+    let record = serde_json::json!({
+        "version": 7,
+        "record": {
+            "identity": {
+                "formatVersion": format_version,
+                "createdAt": created_at_ms,
+                "cwd": cwd,
+                "isSeeded": false,
+                "inheritedEventCount": 0
+            },
+            "rows": {}
+        }
+    });
+    let tmp = file.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_string(&record).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("写 projcache 失败：{e}"))?;
+    fs::rename(&tmp, &file).map_err(|e| format!("改名 projcache 失败：{e}"))?;
+    Ok(())
+}
+
+/// 往目标 workspace.json 追加会话索引——严格遵循官方真实 schema（AIO/官方/v4lite 实证统一）：
+///   { unit:{name:"workspace",version:2},
+///     global:{ initialized, workspaceIds:[UUID...], archivedSessionIds:[...] },
+///     tables:{ workspaces:{ "<UUID>": {path,title,sessionIds,createdAt,updatedAt} } } }
+///
+/// 关键原则（本次事故教训）：
+///   1. 绝不覆盖整个文件——读出现有 doc，只增量合并，保留所有不认识/已有的字段与工作区。
+///   2. 工作区 key 是 UUID 且必须注册进 global.workspaceIds；path 匹配到现有工作区就复用它的 key。
+///   3. 写入用"临时文件+改名"原子写，并先把原文件备份为 .bak，写坏可回滚。
 fn append_to_workspace_index(target_home: &Path, cwd: &str, new_session_ids: &[String]) -> Result<(), String> {
     let ws_file = target_home.join("storages").join("workspace.json");
     if let Some(parent) = ws_file.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("建 storages 目录失败：{e}"))?;
     }
+    // 读出现有文档（不存在则用空骨架）。绝不丢任何已有内容。
     let mut doc: serde_json::Value = if ws_file.is_file() {
         let text = fs::read_to_string(&ws_file).map_err(|e| format!("读 workspace.json 失败：{e}"))?;
-        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
+        serde_json::from_str(&text).map_err(|e| format!("workspace.json 不是有效 JSON（已中止，未改动）：{e}"))?
     } else {
-        serde_json::json!({})
+        serde_json::json!({
+            "unit": { "name": "workspace", "version": 2 },
+            "global": { "initialized": true, "workspaceIds": [], "archivedSessionIds": [] },
+            "tables": { "workspaces": {} }
+        })
     };
     if !doc.is_object() {
-        doc = serde_json::json!({});
+        return Err("workspace.json 顶层不是对象（已中止，未改动）".into());
     }
-    // 确保 workspaces 数组存在
-    if doc.get("workspaces").is_none() {
-        doc["workspaces"] = serde_json::json!({});
+    // 确保骨架字段存在（不覆盖已有值）
+    if doc.get("unit").is_none() {
+        doc["unit"] = serde_json::json!({ "name": "workspace", "version": 2 });
     }
-    // workspaces 结构（实证）：{ "<wsId>": { "sessionIds": [...], "path"/"cwd": ... } }
-    let ws = doc["workspaces"].as_object_mut().ok_or("workspaces 不是对象")?;
-    // 找与 cwd 匹配的工作区（字段名兼容 path / cwd）
+    if doc.get("global").is_none() {
+        doc["global"] = serde_json::json!({ "initialized": true, "workspaceIds": [], "archivedSessionIds": [] });
+    }
+    if doc.get("tables").is_none() {
+        doc["tables"] = serde_json::json!({ "workspaces": {} });
+    }
+    if doc["tables"].get("workspaces").is_none() {
+        doc["tables"]["workspaces"] = serde_json::json!({});
+    }
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // 在 tables.workspaces 里找 path 匹配的工作区
+    let ws_table = doc["tables"]["workspaces"].as_object_mut().ok_or("tables.workspaces 不是对象")?;
     let mut target_key: Option<String> = None;
-    for (k, v) in ws.iter() {
-        let p = v.get("path").or_else(|| v.get("cwd")).and_then(|x| x.as_str());
-        if p == Some(cwd) {
+    for (k, v) in ws_table.iter() {
+        if v.get("path").and_then(|x| x.as_str()) == Some(cwd) {
             target_key = Some(k.clone());
             break;
         }
     }
-    let key = target_key.unwrap_or_else(|| {
-        // 新建工作区条目：用 cwd 的 projectKey 作为可读 key（不保证与 DSH 内部 wsId 一致，
-        // 但 DSH 打开时会按 cwd 归并；这是"放置+让目标自己转"的体现）
-        format!("ws-{}", project_key(cwd).trim_matches('-'))
-    });
-    let entry = ws.entry(key.clone()).or_insert_with(|| serde_json::json!({ "path": cwd, "sessionIds": [] }));
-    if entry.get("path").is_none() {
-        entry["path"] = serde_json::json!(cwd);
+    let (key, is_new) = match target_key {
+        Some(k) => (k, false),
+        None => (uuid::Uuid::new_v4().to_string(), true),
+    };
+    if is_new {
+        // 新建工作区条目（title 取 cwd 末段）
+        let title = cwd.rsplit(['\\', '/']).find(|s| !s.is_empty()).unwrap_or(cwd).to_string();
+        ws_table.insert(key.clone(), serde_json::json!({
+            "path": cwd,
+            "title": title,
+            "sessionIds": [],
+            "createdAt": now,
+            "updatedAt": now,
+        }));
     }
+    // 追加 sessionIds（去重），并刷新 updatedAt
+    let entry = ws_table.get_mut(&key).ok_or("工作区条目缺失")?;
+    if entry.get("path").is_none() { entry["path"] = serde_json::json!(cwd); }
+    if entry.get("sessionIds").is_none() { entry["sessionIds"] = serde_json::json!([]); }
     let arr = entry["sessionIds"].as_array_mut().ok_or("sessionIds 不是数组")?;
     for id in new_session_ids {
         if !arr.iter().any(|x| x.as_str() == Some(id.as_str())) {
             arr.push(serde_json::json!(id));
         }
+    }
+    entry["updatedAt"] = serde_json::json!(now);
+
+    // 新工作区要注册进 global.workspaceIds
+    if is_new {
+        let g = doc["global"].as_object_mut().ok_or("global 不是对象")?;
+        if g.get("workspaceIds").is_none() { g.insert("workspaceIds".into(), serde_json::json!([])); }
+        let ids = g["workspaceIds"].as_array_mut().ok_or("workspaceIds 不是数组")?;
+        if !ids.iter().any(|x| x.as_str() == Some(key.as_str())) {
+            ids.push(serde_json::json!(key));
+        }
+    }
+
+    // 备份原文件再原子写（安全红线：先备份，写坏可回滚）
+    if ws_file.is_file() {
+        let bak = ws_file.with_extension("vault-bak");
+        fs::copy(&ws_file, &bak).map_err(|e| format!("备份 workspace.json 失败：{e}"))?;
     }
     let text = serde_json::to_string_pretty(&doc).map_err(|e| format!("序列化 workspace.json 失败：{e}"))?;
     let tmp = ws_file.with_extension("migrate.tmp");
@@ -395,6 +494,8 @@ pub fn migrate_sessions(
             Ok(_) => {
                 result.migrated += 1;
                 ids_by_cwd.entry(cwd.clone()).or_default().push(new_id.clone());
+                // 补建最小合法投影缓存，让对话列表能看见这条（否则"只看见项目看不见对话"）
+                let _ = write_minimal_projection_cache(target_home, &new_id, e.created_at_ms, &cwd, e.generation);
                 let mut note = String::new();
                 if new_id != e.id { note.push_str(&format!("id 冲突已换新（{}）", &new_id[..new_id.len().min(16)])); }
                 if let Some(orig) = &preset_mapped {
@@ -528,6 +629,100 @@ mod tests {
         // workspace.json 已追加
         let ws = fs::read_to_string(tgt.join("storages").join("workspace.json")).unwrap();
         assert!(ws.contains("s1"), "索引应含 s1");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_index_uses_correct_schema_and_preserves_existing() {
+        // 本次事故回归：索引必须写进 tables.workspaces + global.workspaceIds，且不覆盖已有工作区
+        let base = setup_repo().join("tgt");
+        // 预置一个官方真实 schema 的 workspace.json（含一个已有工作区 + archived）
+        let existing_id = "11111111-2222-3333-4444-555555555555";
+        let preexisting = serde_json::json!({
+            "unit": { "name": "workspace", "version": 2 },
+            "global": { "initialized": true, "workspaceIds": [existing_id], "archivedSessionIds": ["archived-1"] },
+            "tables": { "workspaces": {
+                existing_id: { "path": "D:\\old", "title": "old", "sessionIds": ["old-s"], "createdAt": "x", "updatedAt": "x" }
+            }},
+            "customField": { "keep": "me" }
+        });
+        let storages = base.join("storages");
+        fs::create_dir_all(&storages).unwrap();
+        fs::write(storages.join("workspace.json"), serde_json::to_string_pretty(&preexisting).unwrap()).unwrap();
+
+        append_to_workspace_index(&base, "E:\\VS", &["s1".into(), "s2".into()]).unwrap();
+
+        let doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(storages.join("workspace.json")).unwrap()).unwrap();
+        // 已有工作区还在
+        assert!(doc["tables"]["workspaces"].get(existing_id).is_some(), "已有工作区不应被覆盖");
+        // 原有 customField 保留
+        assert_eq!(doc["customField"]["keep"], "me", "不认识的字段应保留");
+        // archived 保留
+        assert!(doc["global"]["archivedSessionIds"].as_array().unwrap().iter().any(|x| x == "archived-1"));
+        // 新工作区在 tables.workspaces，path 正确，sessionIds 含 s1/s2
+        let new_ws = doc["tables"]["workspaces"].as_object().unwrap().values()
+            .find(|v| v["path"] == "E:\\VS").expect("应有新工作区");
+        let ids: Vec<&str> = new_ws["sessionIds"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        assert!(ids.contains(&"s1") && ids.contains(&"s2"), "新工作区应含迁移会话");
+        // 新工作区 key 注册进了 global.workspaceIds
+        let ws_ids: Vec<&str> = doc["global"]["workspaceIds"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        assert_eq!(ws_ids.len(), 2, "应有 2 个工作区 id（旧+新）");
+        // 备份文件已生成
+        assert!(storages.join("workspace.vault-bak").is_file() || storages.join("workspace.json.vault-bak").is_file()
+            || fs::read_dir(&storages).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("vault-bak")),
+            "应生成 .vault-bak 备份");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_index_appends_to_existing_workspace_same_path() {
+        // 同一 cwd 已有工作区时：复用其 key，只追加 sessionIds，不新建
+        let base = setup_repo().join("tgt");
+        let ws_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let preexisting = serde_json::json!({
+            "unit": { "name": "workspace", "version": 2 },
+            "global": { "initialized": true, "workspaceIds": [ws_id], "archivedSessionIds": [] },
+            "tables": { "workspaces": {
+                ws_id: { "path": "E:\\VS", "title": "VS", "sessionIds": ["existing-s"], "createdAt": "x", "updatedAt": "x" }
+            }}
+        });
+        let storages = base.join("storages");
+        fs::create_dir_all(&storages).unwrap();
+        fs::write(storages.join("workspace.json"), serde_json::to_string_pretty(&preexisting).unwrap()).unwrap();
+
+        append_to_workspace_index(&base, "E:\\VS", &["new-s".into()]).unwrap();
+
+        let doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(storages.join("workspace.json")).unwrap()).unwrap();
+        // 仍只有 1 个工作区
+        assert_eq!(doc["global"]["workspaceIds"].as_array().unwrap().len(), 1, "同 path 不应新建工作区");
+        // sessionIds 是 existing-s + new-s（去重追加）
+        let ids: Vec<&str> = doc["tables"]["workspaces"][ws_id]["sessionIds"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        assert!(ids.contains(&"existing-s") && ids.contains(&"new-s"), "应追加而非覆盖: {:?}", ids);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrate_writes_minimal_projection_cache() {
+        // 本次事故回归：迁移后每条会话都应有最小合法 projcache 记录（否则对话列表看不见）
+        let base = setup_repo();
+        let repo = base.join("repo"); fs::create_dir_all(&repo).unwrap();
+        let src = base.join("src");
+        let tgt = base.join("tgt");
+        fs::create_dir_all(tgt.join("sessions")).unwrap();
+        make_session(&src, "E:\\VS", "s1", None, "standard");
+
+        migrate_sessions(&repo, &src, &tgt, &["s1".into()]).unwrap();
+
+        let cache = tgt.join("storages").join("session_projcache").join("sessions").join("s1.json");
+        assert!(cache.is_file(), "迁移后应有 projcache 记录: {}", cache.display());
+        let doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
+        assert_eq!(doc["version"], 7);
+        assert!(doc["record"]["identity"].is_object(), "应有 identity");
+        assert_eq!(doc["record"]["identity"]["cwd"], "E:\\VS");
+        assert!(doc["record"]["rows"].is_object(), "rows 可为空对象但必须是对象");
+        // 再迁一次（已有缓存）不应覆盖官方更完整的记录
         let _ = fs::remove_dir_all(&base);
     }
 
