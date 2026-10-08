@@ -485,6 +485,11 @@ pub fn adopt_home_with_progress(
             running.join(", ")
         ));
     }
+    // 1.5 链接能力预检：junction 与 symlink 都不可用时，提前返回清晰指引（不动任何文件）。
+    let cap = check_link_capability(home_path);
+    if !cap.junction_ok && !cap.symlink_ok {
+        return Err(cap.advice);
+    }
     // 2. 半完成状态自愈：历史接管中断会把目录搬进仓库但没建链接，先还原再继续。
     if let Some(partial) = detect_partial_adoption(repo, home_path) {
         let restored = repair_partial_adoption(repo, home_path)
@@ -1187,6 +1192,54 @@ fn rollback_partial(files_root: &Path, home_path: &Path, links: &[LinkMapping], 
     }
 }
 
+/// 链接能力预检：能否在当前权限下创建目录链接（junction 免管理员）。
+/// 在 home 旁试建一个临时 junction，成功即可放心接管；失败则说明需开开发者模式/管理员。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkCapability {
+    /// junction 是否可用（免管理员）
+    pub junction_ok: bool,
+    /// symlink 是否可用（需开发者模式/管理员）
+    pub symlink_ok: bool,
+    /// 给用户看的结论与建议
+    pub advice: String,
+}
+
+pub fn check_link_capability(home_path: &Path) -> LinkCapability {
+    let parent = home_path.parent().unwrap_or(home_path);
+    let probe_target = parent.join(".dsh-vault-cap-probe-target");
+    let probe_link = parent.join(".dsh-vault-cap-probe-link");
+
+    // 清理历史残留
+    let _ = fs::remove_dir(&probe_link);
+    let _ = fs::remove_dir_all(&probe_target);
+    let _ = fs::create_dir_all(&probe_target);
+
+    // 1) junction 能力（免管理员）
+    let junction_ok = junction::create(&probe_link, &probe_target).is_ok();
+    let _ = fs::remove_dir(&probe_link);
+
+    // 2) symlink 能力（仅 Windows 上有意义；非 Windows 默认可用）
+    #[cfg(windows)]
+    let symlink_ok = {
+        std::os::windows::fs::symlink_dir(&probe_target, &probe_link).is_ok()
+    };
+    #[cfg(not(windows))]
+    let symlink_ok = true;
+    let _ = fs::remove_dir(&probe_link);
+    let _ = fs::remove_dir_all(&probe_target);
+
+    let advice = if junction_ok {
+        "当前权限可直接接管（使用免管理员的目录联接）。".to_string()
+    } else if symlink_ok {
+        "junction 不可用，但可用符号链接接管。".to_string()
+    } else {
+        "当前权限无法创建目录链接。请开启 Windows 开发者模式（设置→系统→开发者选项→开发者模式），或右键以管理员身份运行本工具后重试。".to_string()
+    };
+
+    LinkCapability { junction_ok, symlink_ok, advice }
+}
+
 /// 半完成状态描述：某目录被搬进了仓库，但原位置没有链接（历史接管中断残留）。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1323,6 +1376,26 @@ mod tests {
         // 修复后不再检测到搁浅
         assert!(detect_partial_adoption(&repo, &home).is_none());
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn link_capability_check_reports_status() {
+        // 预检应返回结论；本机普通权限下 junction 应可用（免管理员）。
+        let base = std::env::temp_dir().join(format!("dsh-cap-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let cap = check_link_capability(&home);
+        // 至少 junction 或 symlink 其一可用；普通权限下 junction 应可用
+        assert!(cap.junction_ok || cap.symlink_ok, "本机应至少有一种链接方式可用");
+        assert!(!cap.advice.is_empty(), "应给出文字建议");
+        // 预检不应在 home 旁留下探针目录
+        let leftover: Vec<_> = fs::read_dir(&base).unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("cap-probe"))
+            .collect();
+        assert!(leftover.is_empty(), "预检后不应残留探针目录");
         let _ = fs::remove_dir_all(&base);
     }
 

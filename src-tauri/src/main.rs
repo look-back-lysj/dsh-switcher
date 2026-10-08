@@ -239,6 +239,11 @@ fn clear_scan_cache() {
 }
 
 #[tauri::command]
+fn check_link_capability(home_path: String) -> adopt::LinkCapability {
+    adopt::check_link_capability(&PathBuf::from(home_path))
+}
+
+#[tauri::command]
 fn detect_partial(repo: String, home_path: String) -> Option<adopt::PartialAdoption> {
     adopt::detect_partial_adoption(&PathBuf::from(repo), &PathBuf::from(home_path))
 }
@@ -449,7 +454,8 @@ fn main() {
             detect_partial,
             repair_partial,
             load_scan_cache,
-            clear_scan_cache
+            clear_scan_cache,
+            check_link_capability
         ])
         .setup(move |app| {
             let mut builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
