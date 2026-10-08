@@ -32,6 +32,7 @@ fn scan_homes() -> ScanResult {
     }
     // 记录扫描结果（quick），失败不阻断返回；增量合并防浅扫覆盖深扫
     let _ = scan_cache::merge_save(&homes, "quick");
+    oplog::record("scan", "", "快速扫描", &format!("识别到 {} 个环境", homes.len()), "ok", "");
     ScanResult {
         homes,
         default_repo: default_repo(),
