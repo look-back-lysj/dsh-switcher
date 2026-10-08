@@ -41,9 +41,15 @@
 - 19/19 单元+e2e 测试全部通过（含新增 junction×2、半完成修复、缓存 roundtrip、权限预检测试）。
 - 真实 exe 端到端：扫描→缓存→（接管/断开由 cargo test 临时目录覆盖）。
 
-## 构建
-- release exe：D:\rust-target\dsh-vault-msvc\release\dsh-vault.exe
-- 尚未打包 NSIS 安装包（见下「待办」）。
+## 构建与安装（已完成）
+- NSIS 安装包：D:\rust-target\dsh-vault-msvc\release\bundle\nsis\DSH Vault_0.1.0_x64-setup.exe（4.04 MiB）
+- 已安装到本机：%LOCALAPPDATA%\DSH Vault\dsh-vault.exe
+- 安装版 CDP 验证：4 环境卡片渲染、3 接管按钮、统计区正常
+- 真实 GUI 接管→断开全链路通过（junction 预检 junctionOk=true / 半完成检测 null / 移动 sessions+skills / 断开还原）
+
+## 关键回归修复（commit 78e2bbd）
+- 模块 D 补丁误把 is-missing 应用到 renderHealth（该函数无 missing 变量），运行抛 ReferenceError 致 home-list 空白。已通过 CDP 发现并修复：renderHealth 移除重复的 home-list 渲染，职责统一归 renderEnvironment。
+- 教训：前端改动必须在真实安装版 GUI 上验证渲染，不能只靠 node --check。
 
 ## 遗留 / 待办（非阻塞）
 - 取消令牌 CancellationToken + 前端取消按钮（卡死已根治，此为体验增强）。
