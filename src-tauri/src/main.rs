@@ -306,6 +306,8 @@ fn print_scan_json() {
     if let Some(agents) = scanner::discover_agents_home() {
         homes.push(agents);
     }
+    // CLI 与 GUI 一致：扫描结果写缓存
+    let _ = scan_cache::save(&homes, "quick");
     println!("{}", serde_json::to_string_pretty(&ScanResult { homes, default_repo: default_repo() }).expect("序列化扫描结果失败"));
 }
 
@@ -392,6 +394,7 @@ fn main() {
             let quick = !args.iter().any(|v| v == "--deep");
             let t = std::time::Instant::now();
             let homes = multiscan::multi_scan(quick);
+            let _ = scan_cache::save(&homes, if quick { "quick" } else { "deep" });
             let out = serde_json::json!({
                 "elapsed_ms": t.elapsed().as_millis(),
                 "count": homes.len(),
