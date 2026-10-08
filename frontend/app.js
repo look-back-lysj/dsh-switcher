@@ -1324,11 +1324,24 @@ async function doSwitch() {
     return;
   }
   const withCredential = $('sw-config').checked || ($('sw-presets') && $('sw-presets').checked);
+  // v4.2 模块C：切换前预检（只读），把风险提示提前摆进确认框
+  let preflight = null;
+  try {
+    preflight = await invoke('switch_preflight', {
+      repo: state.defaultRepo,
+      sourceHome: state.switchSource,
+      targetHome: state.switchTarget,
+    });
+  } catch (e) { /* 预检失败不阻断切换，只是少了预告 */ }
   const confirmItems = [
-    `切换后，打开「${t?.label}」会看到「${s?.label}」的${types.join('、')}。`,
-    `会先给「${t?.label}」保存一份保险快照，万一不对可以切回来。`,
-    '请确认所有 DSH 窗口已关闭。',
+    `本操作是【替换】：会用「${s?.label}」的${types.join('、')}覆盖「${t?.label}」的同类内容。`,
+    `「${t?.label}」独有的内容会先存进保险快照，万一不对可以切回来。`,
+    '模型提供方配置（settings.yaml）会一并带过去，但 API Key 永远不带（安全设计）。',
+    '请确认所有 DSH 窗口已关闭，切换后请重启目标版本。',
   ];
+  if (preflight && preflight.notices && preflight.notices.length) {
+    preflight.notices.forEach(n => confirmItems.push(n));
+  }
   if (withCredential) {
     confirmItems.push('注意：API Key 不会随切换迁移（安全设计）。切换后若目标环境发不出消息，请在该版本设置里重新录入一次 API Key。');
   }
@@ -1352,6 +1365,9 @@ async function doSwitch() {
       includePresets: $('sw-presets') ? $('sw-presets').checked : false,
     }));
     let msg = `切换完成：${result.switchedLinks} 类内容已从「${s?.label}」切到「${t?.label}」。目标环境的原内容已存入保险快照「${result.backupSnapshot}」。`;
+    if (result.settingsCopied) {
+      msg += `\n\n模型提供方配置已一并带过去（settings.yaml）。请重启「${t?.label}」，它启动时会自动导入这份配置。`;
+    }
     if (result.credentialNote) {
       msg += `\n\n提醒：API Key 没有随切换迁移（密钥环保护，安全设计）。如果「${t?.label}」发不出消息，打开它的设置 → 凭据，重新录入一次 API Key 即可。`;
     }
@@ -1359,6 +1375,8 @@ async function doSwitch() {
       msg += `\n\n${result.warnings.join('\n')}`;
     }
     showResult($('switch-result'), msg, false);
+    // v4.2 模块A：切换后自动做"可路由性体检"，告诉用户每条对话能不能直接继续聊
+    renderRouteCheck(state.switchTarget);
     await renderSwitch();
     updateSwitchRoute();
     backgroundRescan(); // 切换后后台刷新缓存
@@ -1366,6 +1384,48 @@ async function doSwitch() {
     showResult($('switch-result'), `切换失败：${e.message}`, true);
   } finally {
     setBusy(btn, false);
+  }
+}
+
+// v4.2 模块A：切换后体检。逐条会话判定"能不能直接继续聊"，结果以待办卡片呈现。
+async function renderRouteCheck(targetHome) {
+  const card = $('routecheck-card');
+  if (!card) return;
+  if (!targetHome) { card.hidden = true; return; }
+  card.hidden = false;
+  $('routecheck-sub').textContent = '正在逐条检查对话…';
+  $('routecheck-todo').innerHTML = '';
+  $('routecheck-list').innerHTML = '';
+  try {
+    const report = await invoke('check_routability', { targetHome });
+    $('routecheck-sub').textContent =
+      `共 ${report.total} 条对话：可直接继续 ${report.ok} 条` +
+      (report.needModel ? `，需换模型 ${report.needModel} 条` : '') +
+      (report.archived ? `，已归档 ${report.archived} 条` : '') +
+      (report.attachmentMissing ? `，附件可能缺失 ${report.attachmentMissing} 条` : '');
+    const todo = $('routecheck-todo');
+    todo.innerHTML = '';
+    (report.todoLines || []).forEach(line => {
+      const li = document.createElement('li');
+      li.textContent = line;
+      todo.appendChild(li);
+    });
+    const list = $('routecheck-list');
+    list.innerHTML = '';
+    const label = { ok: '可直接继续', need_model: '需换模型', need_credential: '需补 Key', archived: '已归档', cwd_missing: '工作目录缺失', attachment_missing: '附件缺失' };
+    (report.verdicts || []).forEach(v => {
+      const row = document.createElement('div');
+      row.className = 'routecheck-row' + (v.status === 'ok' ? '' : ' warn');
+      const route = v.route ? ` · ${v.route}` : '';
+      const notes = (v.notes && v.notes.length) ? ` — ${v.notes.join('；')}` : '';
+      row.textContent = `[${label[v.status] || v.status}] 对话 ${v.titleHint}${route}${notes}`;
+      list.appendChild(row);
+    });
+    if (!report.total) {
+      list.innerHTML = '<div class="routecheck-row">本次切换的目标端没有可体检的对话。</div>';
+    }
+  } catch (e) {
+    $('routecheck-sub').textContent = `体检失败：${e.message || e}（不影响切换结果本身）`;
   }
 }
 

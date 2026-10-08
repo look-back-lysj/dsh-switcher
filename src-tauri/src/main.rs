@@ -375,6 +375,15 @@ async fn switch_links(
     result
 }
 #[tauri::command]
+fn switch_preflight(repo: String, source_home: String, target_home: String) -> Result<adopt::SwitchPreflight, String> {
+    Ok(adopt::switch_preflight(
+        &PathBuf::from(repo),
+        &PathBuf::from(source_home),
+        &PathBuf::from(target_home),
+    ))
+}
+
+#[tauri::command]
 fn check_routability(target_home: String) -> Result<routecheck::RouteCheckReport, String> {
     Ok(routecheck::check_routability(&PathBuf::from(target_home)))
 }
@@ -545,6 +554,7 @@ fn main() {
             undo_last,
             list_rollback_ledgers,
             check_routability,
+            switch_preflight,
             preview_rollback_compensate,
             apply_rollback_compensate,
             export_backup,

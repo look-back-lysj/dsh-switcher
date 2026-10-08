@@ -222,6 +222,57 @@ input[type="text"]:hover, select:hover { border-color: #d1d5db; }
 }
 .result.error { border-color: #fecaca; background: var(--color-danger-bg); color: var(--color-danger); }
 
+/* ===== v4.2 对话可用性体检卡片（浅色克制风，呼应 .result） ===== */
+.routecheck-card {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-hairline);
+  border-left: 3px solid #3f63d8;
+  border-radius: var(--radius-control);
+  background: #f7f9fe;
+}
+.routecheck-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.routecheck-head strong { color: var(--color-ink); font-size: 14px; }
+.routecheck-sub { color: var(--color-ink-secondary); font-size: 12.5px; }
+.routecheck-todo {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  color: var(--color-ink-secondary);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.routecheck-todo li + li { margin-top: 4px; }
+.routecheck-detail { margin-top: 10px; }
+.routecheck-detail summary {
+  cursor: pointer;
+  color: #3f63d8;
+  font-size: 12.5px;
+  user-select: none;
+}
+.routecheck-list {
+  margin-top: 8px;
+  max-height: 260px;
+  overflow: auto;
+  border-top: 1px dashed var(--color-hairline);
+  padding-top: 8px;
+}
+.routecheck-row {
+  font-size: 12.5px;
+  color: var(--color-ink-secondary);
+  padding: 3px 0;
+  font-family: ui-monospace, Consolas, monospace;
+}
+.routecheck-row.warn { color: #b45309; }
+@media (prefers-reduced-motion: no-preference) {
+  .routecheck-card { animation: rc-fade-in .25s ease-out; }
+  @keyframes rc-fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+}
+
 @media (max-width: 1120px) {
   .summary-grid { grid-template-columns: repeat(2, 1fr); }
   .home-row { grid-template-columns: 1fr; }

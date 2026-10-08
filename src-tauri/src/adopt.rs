@@ -815,6 +815,81 @@ pub struct SwitchResult {
     pub settings_copied: bool,
 }
 
+/// v4.2 模块C：切换前预检（只读，不写任何东西）。
+/// 给前端在弹确认框前拿到"风险清单"，让用户知情后再点确认。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchPreflight {
+    /// 源端 sessions 最近 10 秒内是否有写入（源 DSH 可能开着）
+    pub source_writing: bool,
+    /// 目标端有、源端没有的会话条数（切换后会被移入保险快照）
+    pub target_only_sessions: usize,
+    /// 源端是否有 settings.yaml 可带
+    pub source_has_settings: bool,
+    /// 逐条提示文案（前端直接渲染）
+    pub notices: Vec<String>,
+}
+
+pub fn switch_preflight(repo: &Path, source_home: &Path, target_home: &Path) -> SwitchPreflight {
+    let mut notices = Vec::new();
+
+    // 1. 源端是否正在写入：看 sessions 里最近 10 秒的 mtime
+    let mut source_writing = false;
+    let src_sessions = source_home.join("sessions");
+    if src_sessions.is_dir() {
+        let now = std::time::SystemTime::now();
+        for entry in walkdir::WalkDir::new(&src_sessions).max_depth(3).into_iter().filter_map(Result::ok).take(400) {
+            if !entry.file_type().is_file() { continue; }
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    if now.duration_since(mtime).map(|d| d.as_secs() < 10).unwrap_or(false) {
+                        source_writing = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if source_writing {
+        notices.push("源环境的对话目录 10 秒内有写入，源 DSH 可能还开着。建议先关闭源端再切，避免切到写了一半的对话。".to_string());
+    }
+
+    // 2. 目标端独有会话数（镜像语义预告）
+    let count_sessions = |root: &Path| -> usize {
+        let sessions = root.join("sessions");
+        if !sessions.is_dir() { return 0; }
+        let mut n = 0;
+        for proj in fs::read_dir(&sessions).into_iter().flatten().flatten() {
+            if let Ok(entries) = fs::read_dir(proj.path()) {
+                n += entries.flatten().filter(|e| e.path().is_dir()).count();
+            }
+        }
+        n
+    };
+    let src_id = home_id_of(source_home);
+    let tgt_id = home_id_of(target_home);
+    let src_store = repo_files_dir(repo, &src_id);
+    let tgt_store = repo_files_dir(repo, &tgt_id);
+    let src_n = count_sessions(&src_store);
+    let tgt_n = count_sessions(&tgt_store);
+    let target_only = tgt_n.saturating_sub(src_n);
+    if target_only > 0 {
+        notices.push(format!(
+            "目标环境比源环境多约 {target_only} 条对话。切换是【替换】：这些目标端独有的对话会先存进保险快照（可回滚），不会丢。"
+        ));
+    }
+
+    // 3. settings.yaml
+    let source_has_settings = source_home.join("settings.yaml").is_file();
+    if source_has_settings {
+        notices.push("会把源端的模型提供方配置（settings.yaml）一并带过去，API Key 不带。".to_string());
+    } else {
+        notices.push("源端没有 settings.yaml（可能用的是 profile 配置）。切换后若历史对话报缺提供方，请在目标版本设置里检查。".to_string());
+    }
+
+    SwitchPreflight { source_writing, target_only_sessions: target_only, source_has_settings, notices }
+}
+
 /// 把 source_home 的内容切到 target_home：target 的 symlink 改指向 source 的仓库目录。
 /// 类型：sessions/skills/config/memories。切换前给 target 做保险快照（记录清单 + 备份小文件）。
 pub fn switch_links(
@@ -1757,6 +1832,35 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+
+    #[test]
+    fn e2e_switch_preflight() {
+        // 预检：目标比源多会话时应给出 target_only 提示；源端有 settings 应提示会带
+        let base = std::env::temp_dir().join(format!("dsh-vault-preflight-{}", std::process::id()));
+        let repo = base.join("repo");
+        let home_a = base.join("homeA");
+        fs::create_dir_all(home_a.join("sessions").join("pA").join("s1")).unwrap();
+        fs::write(home_a.join("sessions").join("pA").join("s1").join("session.jsonl.zstd"), b"A").unwrap();
+        fs::write(home_a.join("settings.yaml"), b"agent-presets: {}\nllm-pi-ai: {}").unwrap();
+        let home_b = base.join("homeB");
+        // B 有两条会话（比 A 多一条）
+        fs::create_dir_all(home_b.join("sessions").join("pB").join("s2")).unwrap();
+        fs::create_dir_all(home_b.join("sessions").join("pB").join("s3")).unwrap();
+        fs::write(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd"), b"B").unwrap();
+        fs::write(home_b.join("sessions").join("pB").join("s3").join("session.jsonl.zstd"), b"B").unwrap();
+        fs::write(home_b.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        adopt_home(&repo, &home_a, "A").unwrap();
+        adopt_home(&repo, &home_b, "B").unwrap();
+
+        let pf = switch_preflight(&repo, &home_a, &home_b);
+        assert!(pf.source_has_settings, "源端有 settings.yaml");
+        assert_eq!(pf.target_only_sessions, 1, "目标多 1 条会话");
+        assert!(pf.notices.iter().any(|n| n.contains("settings.yaml")), "应提示带配置");
+        assert!(pf.notices.iter().any(|n| n.contains("替换")), "应提示镜像语义");
+
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn e2e_ai_note() {
