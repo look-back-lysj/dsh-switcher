@@ -155,11 +155,13 @@ fn handle_tools_call(id: Value, params: &Value) -> Value {
             let inc_skills = args.get("include_skills").and_then(|v| v.as_bool()).unwrap_or(false);
             let inc_config = args.get("include_config").and_then(|v| v.as_bool()).unwrap_or(false);
             let inc_mem = args.get("include_memories").and_then(|v| v.as_bool()).unwrap_or(false);
+            // v4.1：实验性 preset 默认不跨版本带（官方版不认识会报错）
+            let inc_presets = args.get("include_presets").and_then(|v| v.as_bool()).unwrap_or(false);
             match crate::adopt::switch_links(
                 &repo,
                 &PathBuf::from(source),
                 &PathBuf::from(target),
-                inc_sessions, inc_skills, inc_config, inc_mem,
+                inc_sessions, inc_skills, inc_config, inc_mem, inc_presets,
             ) {
                 Ok(r) => result_ok(id, format!(
                     "切换完成：{} 类内容已切换。目标原件已存保险快照「{}」。",

@@ -806,6 +806,9 @@ pub struct SwitchResult {
     pub backup_snapshot: String,
     pub details: Vec<String>,
     pub warnings: Vec<String>,
+    /// v4.1：凭据不会随切换迁移，前端据此弹重录提示。
+    #[serde(default)]
+    pub credential_note: bool,
 }
 
 /// 把 source_home 的内容切到 target_home：target 的 symlink 改指向 source 的仓库目录。
@@ -818,6 +821,7 @@ pub fn switch_links(
     include_skills: bool,
     include_config: bool,
     include_memories: bool,
+    include_presets: bool,
 ) -> Result<SwitchResult, String> {
     // 1. 校验
     if source_home == target_home {
@@ -838,7 +842,10 @@ pub fn switch_links(
     let mut dirs: Vec<&str> = Vec::new();
     if include_sessions { dirs.push("sessions"); }
     if include_skills { dirs.push("skills"); }
-    if include_config { dirs.extend([".agent-presets", "guard", "storages", "rollbacks", "undo-snapshots"]); }
+    if include_config { dirs.extend(["guard", "storages", "rollbacks", "undo-snapshots"]); }
+    // v4.1：.agent-presets 是实验性 preset（如 anchored-standard 走 gateway 路由），
+    // 跨版本复制会让官方版报「Unknown agent preset」。默认不跨版本带，用户明确勾选才带。
+    if include_presets { dirs.push(".agent-presets"); }
     if include_memories { dirs.extend(["memories", "team"]); }
     if dirs.is_empty() {
         return Err("未选择任何要切换的内容类型。".to_string());
@@ -914,11 +921,19 @@ pub fn switch_links(
         let _ = fs::write(&index_path, text);
     }
 
+    // 切换涉及 config/preset 时，凭据不会迁移（密钥环保护，文件搬过去也解密不了）。
+    // 前端据此提示用户「需在目标版本重新录入 API Key」。
+    let credential_note = include_config || include_presets;
+    if credential_note {
+        warnings.push("凭据（API Key）不会随切换迁移。若目标环境发不出消息，请在该版本设置里重新录入 API Key。".to_string());
+    }
+
     Ok(SwitchResult {
         switched_links: switched,
         backup_snapshot: snap_name,
         details,
         warnings,
+        credential_note,
     })
 }
 
@@ -1592,7 +1607,7 @@ mod tests {
         adopt_home(&repo, &home_b, "B").unwrap();
 
         // 切换：把 A 的 sessions 切到 B
-        let result = switch_links(&repo, &home_a, &home_b, true, false, false, false).expect("切换应成功");
+        let result = switch_links(&repo, &home_a, &home_b, true, false, false, false, false).expect("切换应成功");
         assert_eq!(result.switched_links, 1);
 
         // 验证：B 的 sessions 现在指向 A 的内容（能读到 A-data）
@@ -1666,7 +1681,7 @@ mod tests {
         adopt_home(&repo, &home_a, "A").unwrap();
         adopt_home(&repo, &home_b, "B").unwrap();
 
-        let result = switch_links(&repo, &home_a, &home_b, true, false, false, false).unwrap();
+        let result = switch_links(&repo, &home_a, &home_b, true, false, false, false, false).unwrap();
         assert_eq!(result.switched_links, 1);
         // 切换后 B 读到 A 的内容
         let content = fs::read(home_b.join("sessions").join("pA").join("s1").join("session.jsonl.zstd")).unwrap();

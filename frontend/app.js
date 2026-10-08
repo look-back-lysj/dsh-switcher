@@ -1318,18 +1318,24 @@ async function doSwitch() {
   if ($('sw-skills').checked) types.push('技能');
   if ($('sw-config').checked) types.push('配置');
   if ($('sw-memories').checked) types.push('记忆');
+  if ($('sw-presets') && $('sw-presets').checked) types.push('预设');
   if (!types.length) {
     showResult($('switch-result'), '请至少勾选一种要切换的内容类型。', true);
     return;
   }
+  const withCredential = $('sw-config').checked || ($('sw-presets') && $('sw-presets').checked);
+  const confirmItems = [
+    `切换后，打开「${t?.label}」会看到「${s?.label}」的${types.join('、')}。`,
+    `会先给「${t?.label}」保存一份保险快照，万一不对可以切回来。`,
+    '请确认所有 DSH 窗口已关闭。',
+  ];
+  if (withCredential) {
+    confirmItems.push('注意：API Key 不会随切换迁移（安全设计）。切换后若目标环境发不出消息，请在该版本设置里重新录入一次 API Key。');
+  }
   const accepted = await confirmDialog({
     title: '确认切换',
     message: `将把「${s?.label}」的${types.join('、')}切换到「${t?.label}」。`,
-    items: [
-      `切换后，打开「${t?.label}」会看到「${s?.label}」的${types.join('、')}。`,
-      `会先给「${t?.label}」保存一份保险快照，万一不对可以切回来。`,
-      '请确认所有 DSH 窗口已关闭。',
-    ],
+    items: confirmItems,
   });
   if (!accepted) return;
   const btn = $('switch-execute');
@@ -1343,8 +1349,13 @@ async function doSwitch() {
       includeSkills: $('sw-skills').checked,
       includeConfig: $('sw-config').checked,
       includeMemories: $('sw-memories').checked,
+      includePresets: $('sw-presets') ? $('sw-presets').checked : false,
     }));
-    showResult($('switch-result'), `切换完成：${result.switchedLinks} 类内容已从「${s?.label}」切到「${t?.label}」。目标环境的原内容已存入保险快照「${result.backupSnapshot}」。`, false);
+    let msg = `切换完成：${result.switchedLinks} 类内容已从「${s?.label}」切到「${t?.label}」。目标环境的原内容已存入保险快照「${result.backupSnapshot}」。`;
+    if (result.credentialNote) {
+      msg += `\n\n提醒：API Key 没有随切换迁移（密钥环保护，安全设计）。如果「${t?.label}」发不出消息，打开它的设置 → 凭据，重新录入一次 API Key 即可。`;
+    }
+    showResult($('switch-result'), msg, false);
     await renderSwitch();
     updateSwitchRoute();
     backgroundRescan(); // 切换后后台刷新缓存

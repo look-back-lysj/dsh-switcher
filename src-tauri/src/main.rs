@@ -346,6 +346,7 @@ async fn switch_links(
     include_skills: bool,
     include_config: bool,
     include_memories: bool,
+    include_presets: bool,
 ) -> Result<adopt::SwitchResult, String> {
     let repo_log = repo.clone();
     let route = format!("{} → {}", source_home, target_home);
@@ -358,6 +359,7 @@ async fn switch_links(
             include_skills,
             include_config,
             include_memories,
+            include_presets,
         )
     })
     .await

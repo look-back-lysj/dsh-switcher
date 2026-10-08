@@ -1076,3 +1076,8 @@ input, textarea { caret-color: var(--color-primary); }
   .oplog-item { grid-template-columns: 1fr auto; }
   .oplog-item .oplog-time, .oplog-item .oplog-op { grid-column: auto; }
 }
+
+
+/* ===== 切换页：预设（跨版本慎用） ===== */
+.switch-type-adv { opacity: 0.85; }
+.switch-type-note { display: block; font-size: 11px; color: var(--color-muted, #7a8499); font-weight: 400; }
