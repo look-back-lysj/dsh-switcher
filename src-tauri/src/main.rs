@@ -162,6 +162,16 @@ fn repair_links(repo: String, home_path: String) -> Result<adopt::RepairResult, 
 }
 
 #[tauri::command]
+fn detect_partial(repo: String, home_path: String) -> Option<adopt::PartialAdoption> {
+    adopt::detect_partial_adoption(&PathBuf::from(repo), &PathBuf::from(home_path))
+}
+
+#[tauri::command]
+fn repair_partial(repo: String, home_path: String) -> Result<Vec<String>, String> {
+    adopt::repair_partial_adoption(&PathBuf::from(repo), &PathBuf::from(home_path))
+}
+
+#[tauri::command]
 fn switch_links(
     repo: String,
     source_home: String,
@@ -354,7 +364,9 @@ fn main() {
             scan_home_changes,
             switch_links,
             preview_repair,
-            repair_links
+            repair_links,
+            detect_partial,
+            repair_partial
         ])
         .setup(move |app| {
             let mut builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())

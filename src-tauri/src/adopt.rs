@@ -485,12 +485,20 @@ pub fn adopt_home_with_progress(
             running.join(", ")
         ));
     }
-    // 2. 重复接管检测
+    // 2. 半完成状态自愈：历史接管中断会把目录搬进仓库但没建链接，先还原再继续。
+    if let Some(partial) = detect_partial_adoption(repo, home_path) {
+        let restored = repair_partial_adoption(repo, home_path)
+            .map_err(|e| format!("检测到上次接管未完成，自动修复失败：{e}"))?;
+        if !restored.is_empty() {
+            eprintln!("[dsh-vault] 自动修复半完成接管：已还原 {:?}", restored);
+        }
+    }
+    // 3. 重复接管检测
     if is_adopted(home_path) {
         return Err("该环境已被接管（sessions 已是链接），无需重复接管。".to_string());
     }
     if !crate::scanner::is_confirmed_home(home_path) {
-        return Err("该目录未通过 DSH Home 特征校验，无法接管。".to_string());
+        return Err("该目录未通过 DSH Home 特征校验，无法接管。若确认是 DSH 环境，可能是会话/配置文件缺失。".to_string());
     }
 
     let home_id = home_id_of(home_path);
@@ -499,16 +507,16 @@ pub fn adopt_home_with_progress(
 
     let mut moved_dirs = Vec::new();
     let mut created_links = Vec::new();
-    let mut links = Vec::new();
+    let mut links: Vec<LinkMapping> = Vec::new();
     let mut warnings = Vec::new();
 
-    // 3. 逐个移动 ADOPT_DIRS 并创建 symlink
+    // 3. 逐个移动 ADOPT_DIRS 并创建链接；任一失败则自动回滚到接管前状态。
     for dir in ADOPT_DIRS {
         let src = home_path.join(dir);
         if !src.is_dir() {
             continue;
         }
-        // 防御：若已是 symlink 则跳过
+        // 防御：若已是链接则跳过
         if src.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
             warnings.push(format!("{dir} 已是链接，跳过"));
             continue;
@@ -517,18 +525,34 @@ pub fn adopt_home_with_progress(
         // 进度：接管移动大目录时报告
         let total = count_files(&src);
         emit_op_progress(app, 0, total, &format!("正在移动 {dir}"));
-        move_dir_with_progress(&src, &dst, app)?;
+        // 移动失败 → 回滚已处理目录后返回错误
+        if let Err(e) = move_dir_with_progress(&src, &dst, app) {
+            rollback_partial(&files_root, home_path, &links, &mut warnings);
+            return Err(format!("移动 {dir} 失败：{e}。已自动还原到接管前状态。"));
+        }
         emit_op_progress(app, total, total, &format!("{dir} 完成"));
         moved_dirs.push(dir.to_string());
 
-        let target_str = create_dir_link(&src, &dst).map_err(|e| format!("为 {dir} 创建链接失败：{e}"))?;
-        created_links.push(dir.to_string());
-        let absolute = !same_volume(&src, &dst);
-        links.push(LinkMapping {
-            rel: dir.to_string(),
-            target: target_str,
-            absolute,
-        });
+        // 建链接失败 → 先把刚移动的 dir 搬回，再回滚前面的，最后返回错误
+        match create_dir_link(&src, &dst) {
+            Ok(target_str) => {
+                created_links.push(dir.to_string());
+                let absolute = !same_volume(&src, &dst);
+                links.push(LinkMapping {
+                    rel: dir.to_string(),
+                    target: target_str,
+                    absolute,
+                });
+            }
+            Err(e) => {
+                // 把刚移动的这一个搬回原位
+                if move_dir(&dst, &src).is_err() {
+                    warnings.push(format!("还原 {dir} 失败，请手动把仓库里的 {dir} 移回原位"));
+                }
+                rollback_partial(&files_root, home_path, &links, &mut warnings);
+                return Err(format!("为 {dir} 创建链接失败：{e}。已自动还原到接管前状态。"));
+            }
+        }
     }
 
     // 4. profiles/ 声明文件备份（不移动 profiles 本体）
@@ -1145,6 +1169,77 @@ pub fn remove_ai_note(home_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 回滚部分接管：删除已建链接、把已移动目录搬回原位。
+fn rollback_partial(files_root: &Path, home_path: &Path, links: &[LinkMapping], warnings: &mut Vec<String>) {
+    for link in links {
+        let link_path = home_path.join(&link.rel);
+        let store_path = files_root.join(&link.rel);
+        // 删链接（不删目标）
+        if link_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            let _ = fs::remove_dir(&link_path);
+        }
+        // 搬回
+        if store_path.is_dir() && !link_path.exists() {
+            if move_dir(&store_path, &link_path).is_err() {
+                warnings.push(format!("回滚 {} 失败，请手动检查", link.rel));
+            }
+        }
+    }
+}
+
+/// 半完成状态描述：某目录被搬进了仓库，但原位置没有链接（历史接管中断残留）。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialAdoption {
+    pub home_id: String,
+    /// 形如 sessions/skills：在仓库有内容、但原位置缺失且不是链接。
+    pub stranded_dirs: Vec<String>,
+}
+
+/// 检测半完成状态（不依赖 record.json，直接看文件系统）。
+pub fn detect_partial_adoption(repo: &Path, home_path: &Path) -> Option<PartialAdoption> {
+    let home_id = home_id_of(home_path);
+    let files_root = repo_files_dir(repo, &home_id);
+    if !files_root.is_dir() {
+        return None;
+    }
+    let mut stranded = Vec::new();
+    for dir in ADOPT_DIRS {
+        let store = files_root.join(dir);
+        let origin = home_path.join(dir);
+        let is_link = origin.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false);
+        // 仓库有该目录内容，但原位置既不是链接也不存在 → 搁浅
+        if store.is_dir() && !is_link && !origin.exists() {
+            stranded.push(dir.to_string());
+        }
+    }
+    if stranded.is_empty() {
+        None
+    } else {
+        Some(PartialAdoption { home_id, stranded_dirs: stranded })
+    }
+}
+
+/// 自愈半完成状态：把仓库里搁浅的目录搬回原位，恢复到「未接管」干净状态。
+pub fn repair_partial_adoption(repo: &Path, home_path: &Path) -> Result<Vec<String>, String> {
+    let partial = detect_partial_adoption(repo, home_path)
+        .ok_or_else(|| "未检测到半完成状态，无需修复。".to_string())?;
+    let home_id = home_id_of(home_path);
+    let files_root = repo_files_dir(repo, &home_id);
+    let mut restored = Vec::new();
+    for dir in &partial.stranded_dirs {
+        let store = files_root.join(dir);
+        let origin = home_path.join(dir);
+        if origin.exists() {
+            // 原位置已有真实目录，避免覆盖，跳过
+            continue;
+        }
+        move_dir(&store, &origin).map_err(|e| format!("还原 {dir} 失败：{e}"))?;
+        restored.push(dir.clone());
+    }
+    Ok(restored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,6 +1294,35 @@ mod tests {
         junction::create(&link, &target).expect("junction 应成功");
         assert!(link.is_dir(), "通过 junction 应能看到目录");
         fs::remove_dir(&link).unwrap();
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn e2e_detect_and_repair_partial_adoption() {
+        // 模拟历史接管中断：sessions 被搬进仓库，但原位置没有链接。
+        let base = std::env::temp_dir().join(format!("dsh-partial-{}", std::process::id()));
+        let home = base.join("home");
+        let repo = base.join("repo");
+        let home_id = home_id_of(&home);
+        let store = repo.join("adopted").join(&home_id).join("files").join("sessions").join("proj");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("s.jsonl.zstd"), b"data").unwrap();
+        // home 有 DSH 特征但 sessions 缺失（搁浅）
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(".credentials.yaml"), b"t").unwrap();
+        fs::write(home.join("settings.yaml"), b"agent-presets: {}").unwrap();
+
+        // 应检测到半完成
+        let partial = detect_partial_adoption(&repo, &home).expect("应检测到搁浅");
+        assert!(partial.stranded_dirs.contains(&"sessions".to_string()));
+
+        // 修复：sessions 搬回原位
+        let restored = repair_partial_adoption(&repo, &home).expect("修复应成功");
+        assert!(restored.contains(&"sessions".to_string()));
+        assert!(home.join("sessions").join("proj").join("s.jsonl.zstd").is_file());
+        // 修复后不再检测到搁浅
+        assert!(detect_partial_adoption(&repo, &home).is_none());
+
         let _ = fs::remove_dir_all(&base);
     }
 
