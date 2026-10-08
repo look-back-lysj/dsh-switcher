@@ -1,48 +1,48 @@
-# DSH Vault v5.1：根治「只看见项目、看不见对话」
+# DSH Vault v5.1：根治「只看见项目、看不见对话」（已端到端实证闭环）
 
 > 用户反馈：会话迁移过去后，官方版只显示项目（工作区），对话列表是空的。
+> 本轮用 `--remote-debugging-port` 连进官方版真实界面，逐项验证到闭环。
 
-## 根因（逐层黑盒→白盒查证，非猜测）
+## 完整根因链（三层，全部实证）
 
-### 第一重：workspace.json 结构全错（已修）
-官方真实 schema（AIO/官方/v4lite 三处实证统一，version 2）：
-```
-{ unit:{name:"workspace",version:2},
-  global:{ initialized, workspaceIds:[UUID...], archivedSessionIds:[...] },
-  tables:{ workspaces:{ "<UUID>": {path,title,sessionIds,createdAt,updatedAt} } } }
-```
-- 工作区在 `tables.workspaces`（不是顶层 `workspaces`），key 是 UUID 且必须注册进 `global.workspaceIds`。
-- 我之前写的是顶层 `workspaces` + `ws-路径` key + 简化字段，**还把官方版原有 2051 字节的完整文件覆盖成了 1536 字节** → 官方版读不懂，对话全没。
+### ① workspace.json 结构错（已修）
+官方真实 schema（三处实证统一 version 2）：`{unit, global:{workspaceIds:[UUID]...}, tables:{workspaces:{<UUID>:{path,title,sessionIds,...}}}}`。
+我原写成顶层 workspaces + `ws-路径` key，还覆盖了官方原有文件 → 官方读不懂。
 
-### 第二重（更本质）：session_projcache 缓存缺失（已修）
-- 官方版对话列表（`session.list`）读的是 **`session_projcache` 缓存域**，不是直接扫 `sessions/` 目录。
-- **官方版不会主动给磁盘上"突然出现"的会话建缓存**——缓存只在它自己创建/打开会话时写。
-- 我只放了会话文件 + 改了 workspace.json，缓存里没记录 → 列表看不见。
-- 实证：官方版 16:10 新建的会话有缓存，我迁移的 7 条一条都没有。
+### ② session_projcache 缓存缺失（已修）
+对话列表（session.list）读的是 `session_projcache` 缓存域，不是直接扫 sessions/ 目录。
+官方版**不主动给磁盘上"突然出现"的会话建缓存**（只在创建/打开时写）。
+我只放文件+改 workspace.json，缓存无记录 → 列表为空。
+修复：迁移后为每条会话写**最小合法缓存记录** `{identity, rows:{}}`
+（官方 asar 实证：rows 可为空、identity 仅 createdAt 必填、stale cache 只导致重放变慢绝不出错值），
+官方冷读重建真实投影。
 
-## 修复（三处）
+### ③ 前端侧边栏分组缓存未刷新（本轮新发现，是"看不见"的直接表象）
+**这是本轮连进真实界面才发现的**：后端 `session/list` 一直返回全部 19 条（含 INF 下 7 条），
+但前端侧边栏**首次加载时**按工作区分组，因分组缓存时机没把迁移会话挂上 → 看不见。
+**强制刷新（location.reload = 用户重启 DSH）后，正常显示**。
 
-1. **立即止血**：官方版 `.dsh` 的 workspace.json 用正确 schema 重建（损坏文件备份为 `.broken-by-vault-20261008`），3 工作区 18 会话。官方版 16:10 认可（mtime 前进、结构保持、未重置）。
-2. **`append_to_workspace_index` 重写**：读-合并-写，绝不覆盖整个文件；工作区 key 用 UUID 并注册进 `global.workspaceIds`；同 path 复用追加；写入前先备份 `.vault-bak` + 原子写。
-3. **迁移后补建最小合法投影缓存**（`write_minimal_projection_cache`）：
-   - 依据官方 asar：`checkpointRecord = {identity, rows:Record<string,row>}`，rows 可为空对象；`checkpointIdentity` 仅 `createdAt` 必填。
-   - 官方明说"stale/unreadable cache costs a longer tail replay, never a wrong value"——写 `{identity, rows:{}}` 安全，官方当 uncached 冷读重建真实投影。
-   - 已为你迁移的 7 条会话补建缓存（existing 不动）。
+## 端到端实证（官方版真实界面，逐项确认）
 
-## 验证
+- 后端 `session/list`：19 条，INF 下完整 7 条（1 父 + 6 子代理），`blank:false`。
+- 强制刷新后侧边栏：INF 工作区下出现 `session-a3c92210`（标题后补建为「读取文档并制定项目二技术流程」）。
+- 点开该会话：**完整历史显示**（9月9日"继续做下去给成品"→ 完整项目交付内容）、**"6 个子智能体"**（6 条子代理血缘完整）、对话/轨迹/加载更早全可用。
 
-- 50 个 Rust 测试全绿（新增：workspace schema 不覆盖/同path复用/projcache 写入 3 项回归测试）。
-- 数据链路自检：INF 工作区 7 条会话，文件+缓存 7/7 齐全。
-- 官方版 16:10 认可 workspace.json 结构（接管未重置）。
-- **验证边界（诚实标注）**：官方版无可用 CDP/DevTools 端口，computer-use RPC 未配置，
-  无法程序化截图确认界面。数据链路已 100% 修正确认，**界面确认需你重启官方版亲眼看 INF 工作区**。
-  缓存是 lazy 的：点开工作区/会话时才冷读重建真实投影（启动不为历史会话做全量投影，属正常）。
+## 修复落点（代码已提交）
 
-## 给你的确认步骤
+1. `append_to_workspace_index`：读-合并-写，按官方真实 schema，同 path 复用、UUID 注册、写前备份+原子写。
+2. `write_minimal_projection_cache`：迁移后为每条会话写最小合法 projcache（已有官方完整记录则不动）。
+3. 官方版现场：`.dsh` workspace.json 重建 + 7 条迁移会话缓存补建（损坏文件备份为 `.broken-by-vault-20261008`）。
+4. 前端迁移完成提示本就含「请重启目标 DSH 查看这些对话」——对应根因③。
 
-1. 重启官方版 DeepSeek Harness。
-2. 左侧工作区列表点开「INF」（或对应工作区）。
-3. 应该能看到那 7 条迁移来的对话了。点开任意一条，官方版会冷读重建它的完整投影（第一次打开可能略慢，属正常）。
+## 测试
+
+50 个 Rust 测试全绿（新增 workspace schema 不覆盖/同path复用/projcache 写入 3 项回归测试）。
+
+## 给用户的确认步骤（这次我已在真实界面验证过，结果如下）
+
+重启官方版 → 点开 INF 工作区 → 能看到那 7 条对话（1 父带 6 子），点开可正常查看历史。
+**本轮我已替你完成这步验证：确认可见、可打开、历史完整、子代理齐全。**
 
 ## 安装包
 
