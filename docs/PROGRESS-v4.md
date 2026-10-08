@@ -51,8 +51,14 @@
 - 模块 D 补丁误把 is-missing 应用到 renderHealth（该函数无 missing 变量），运行抛 ReferenceError 致 home-list 空白。已通过 CDP 发现并修复：renderHealth 移除重复的 home-list 渲染，职责统一归 renderEnvironment。
 - 教训：前端改动必须在真实安装版 GUI 上验证渲染，不能只靠 node --check。
 
+## 计划承诺项补齐（2026-10-08 第二轮）
+对照 UPGRADE-PLAN-v4 逐项审计，把第一轮标为「可选/未做」的承诺项全部补齐：
+- **取消令牌**（commit 2275beb）：multi_scan_cancellable + State<CancellationToken>，deep_scan 可被 cancel_operation 中断，前端深度扫描时显示「取消扫描」按钮。
+- **操作互斥**（commit e499a81）：withOpProgress 期间禁用所有耗时操作按钮（嵌套计数），home-list 容器代理禁用接管/断开按钮。
+- **7 天过期提示**（commit 8853c73）：缓存超 7 天未刷新，扫描时间戳旁提示建议重扫。
+- **操作后自动刷新缓存**（commit 8853c73）：接管/断开/切换成功后后台静默 scan_silent 刷新。
+- **磁盘空间检查**（commit 8853c73）：接管前预估 ×2，不足提前报错。
+- **「知道了」/ prompt 修复**（commit 943599b）：原生 prompt() 替换为自定义 promptDialog，消除接管无反应。
+
 ## 遗留 / 待办（非阻塞）
-- 取消令牌 CancellationToken + 前端取消按钮（卡死已根治，此为体验增强）。
-- 操作互斥 UI 置灰。
-- 前端「知道了」自定义模态框修复（模块 E 计划项，本轮聚焦后端稳定性，前端模态框未改）。
-- NSIS 安装包重打包 + 安装到本机/同学机复测。
+- 无。计划全部承诺项已落地并实机验证。
