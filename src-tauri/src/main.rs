@@ -7,6 +7,7 @@ mod oplog;
 mod multiscan;
 mod repo;
 mod preset_fix;
+mod project_key;
 mod routecheck;
 mod scan_cache;
 mod scanner;
