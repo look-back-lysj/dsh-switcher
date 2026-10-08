@@ -979,6 +979,7 @@ function renderEnvironment() {
       </article>
     `;
   }).join('');
+  renderCompatCheck();
 }
 
 async function doAdopt(homePath) {
@@ -1404,6 +1405,25 @@ async function doSwitch() {
   } finally {
     setBusy(btn, false);
   }
+}
+
+// v4.2 模块E：接管兼容性自查。基于报告已确认的三类边界 + 本机 asar 实证。
+function renderCompatCheck() {
+  const card = $('compat-card');
+  if (!card) return;
+  const adoptedHomes = state.homes.filter(h => !h.__missing && state.adoptStatus[h.path]?.adopted);
+  if (!adoptedHomes.length) { card.hidden = true; return; }
+  card.hidden = false;
+  const items = [];
+  // 边界1：skills 路径分裂（官方版读 ~/.agents/skills，已被 asar 实证 DSH_AGENTS_HOME / ~/.agents）
+  const hasSharedSkills = adoptedHomes.some(h => h.kind !== 'agents-home');
+  items.push('技能位置：官方版默认从共享库 ~/.agents/skills 读技能（不是从本环境 skills 目录）。若接管后技能没出现，把共享技能库也接管，或在目标版本里确认技能来源。');
+  // 边界2：实验性 preset
+  items.push('预设兼容：anchored-standard 等实验性预设是社区版特有，官方版可能报 Unknown agent preset。切换时预设默认不跨版本带，需要时再手动勾选。');
+  // 边界3：接管链接依赖仓库盘
+  items.push('链接健康：被接管的目录是指向仓库盘的链接。若仓库所在盘（D 盘）不在线，环境目录会显示为空。别手动删链接，先用本工具断开接管。');
+  $('compat-list').innerHTML = items.map(x => `<li>${x}</li>`).join('');
+  $('compat-sub').textContent = `${adoptedHomes.length} 个环境在接管中`;
 }
 
 // v4.2 模块D：动态跟随。启动/刷新时比对每个已接管环境的对话与技能指纹。
