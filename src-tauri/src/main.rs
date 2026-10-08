@@ -5,6 +5,7 @@ mod mcp;
 mod model;
 mod multiscan;
 mod repo;
+mod scan_cache;
 mod scanner;
 mod export;
 mod zstd_check;
@@ -27,6 +28,8 @@ fn scan_homes() -> ScanResult {
     if let Some(agents) = scanner::discover_agents_home() {
         homes.push(agents);
     }
+    // 记录扫描结果（quick），失败不阻断返回
+    let _ = scan_cache::save(&homes, "quick");
     ScanResult {
         homes,
         default_repo: default_repo(),
@@ -115,7 +118,7 @@ fn import_backup(archive: String, repo: String) -> Result<export::ImportResult, 
 #[tauri::command]
 async fn deep_scan(deep: bool) -> ScanResult {
     // 多算法融合扫描放进阻塞线程池，避免遍历目录时冻结 IPC/WebView。
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let mut homes = multiscan::multi_scan(!deep);
         if let Some(agents) = scanner::discover_agents_home() {
             homes.push(agents);
@@ -126,7 +129,10 @@ async fn deep_scan(deep: bool) -> ScanResult {
         }
     })
     .await
-    .unwrap_or_else(|_| ScanResult { homes: Vec::new(), default_repo: default_repo() })
+    .unwrap_or_else(|_| ScanResult { homes: Vec::new(), default_repo: default_repo() });
+    // 记录扫描结果：deep 记 "deep"，quick 记 "quick"，失败不阻断返回
+    let _ = scan_cache::save(&result.homes, if deep { "deep" } else { "quick" });
+    result
 }
 
 #[tauri::command]
@@ -185,6 +191,51 @@ async fn repair_links(repo: String, home_path: String) -> Result<adopt::RepairRe
     })
     .await
     .map_err(|e| format!("修复任务中断：{e}"))?
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedHome {
+    home: crate::model::DiscoveredHome,
+    exists: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanCacheResponse {
+    found: bool,
+    last_scan_at: String,
+    last_scan_mode: String,
+    homes: Vec<CachedHome>,
+}
+
+#[tauri::command]
+fn load_scan_cache() -> ScanCacheResponse {
+    match scan_cache::load() {
+        Some(cache) => {
+            let marked = scan_cache::with_existence(&cache);
+            ScanCacheResponse {
+                found: true,
+                last_scan_at: cache.last_scan_at,
+                last_scan_mode: cache.last_scan_mode,
+                homes: marked
+                    .into_iter()
+                    .map(|(home, exists)| CachedHome { home, exists })
+                    .collect(),
+            }
+        }
+        None => ScanCacheResponse {
+            found: false,
+            last_scan_at: String::new(),
+            last_scan_mode: String::new(),
+            homes: Vec::new(),
+        },
+    }
+}
+
+#[tauri::command]
+fn clear_scan_cache() {
+    scan_cache::clear();
 }
 
 #[tauri::command]
@@ -396,7 +447,9 @@ fn main() {
             preview_repair,
             repair_links,
             detect_partial,
-            repair_partial
+            repair_partial,
+            load_scan_cache,
+            clear_scan_cache
         ])
         .setup(move |app| {
             let mut builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())

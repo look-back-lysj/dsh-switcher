@@ -130,7 +130,7 @@ function renderHealth() {
   $('home-list').innerHTML = state.homes.map((home, idx) => {
     const [tone, label] = healthBadge(home);
     return `
-      <article class="home-row stagger-item" style="--i:${idx + 4}">
+      <article class="home-row stagger-item${missing ? ' is-missing' : ''}" style="--i:${idx + 4}">
         <div>
           <strong>${home.label}</strong>
           <code>${home.path}</code>
@@ -196,6 +196,30 @@ const selectOpenFile = async (title, filters) => {
     return null;
   }
 };
+// 启动秒读缓存：先把上次扫描结果显示出来，再异步重扫刷新。
+async function loadScanCache() {
+  try {
+    const res = await invoke('load_scan_cache');
+    if (!res.found || !res.homes.length) return false;
+    // 标记已消失的环境（前端标灰提示，不静默丢）
+    state.homes = res.homes.map((c) => {
+      const h = c.home;
+      if (!c.exists) {
+        h.warnings = (h.warnings || []).concat(['该路径已不存在，可能已卸载或移动']);
+        h.__missing = true;
+      }
+      return h;
+    });
+    // defaultRepo 由随后的 scan() 填充；先给缓存时间戳
+    if ($('scan-time')) $('scan-time').textContent = `缓存 ${res.lastScanAt}（后台刷新中…）`;
+    renderEnvironment();
+    fillHomeSelects();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function scan() {
   const button = $('rescan');
   setBusy(button, true, '扫描中…');
@@ -874,12 +898,13 @@ function renderEnvironment() {
     const [tone, label] = healthBadge(home);
     const [atone, alabel] = adoptBadge(home);
     const isDsh = home.kind === 'dsh-home';
-    const adopted = state.adoptStatus[home.path]?.adopted;
-    const btn = isDsh
+    const missing = !!home.__missing;
+    const adopted = !missing && state.adoptStatus[home.path]?.adopted;
+    const btn = isDsh && !missing
       ? (adopted
           ? `<button class="button compact" data-unadopt="${escapeHtml(home.path)}">断开接管</button>`
           : `<button class="button compact primary" data-adopt="${escapeHtml(home.path)}">一键接管</button>`)
-      : '';
+      : (missing ? `<span class="badge muted">已消失</span>` : '');
     return `
       <article class="home-row stagger-item" style="--i:${idx + 4}">
         <div>
@@ -1228,9 +1253,11 @@ function bindNavigation() {
   });
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   bindNavigation();
   setupProgressListeners();
+  // 先秒读缓存显示上次结果，再触发 scan() 后台刷新（见文件末尾）
+  await loadScanCache();
   setupOpProgressListener();
   $('rescan').addEventListener('click', scan);
   $('pick-backup-repo').addEventListener('click', async () => {

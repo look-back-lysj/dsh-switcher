@@ -1036,3 +1036,7 @@ input, textarea { caret-color: var(--color-primary); }
   white-space: pre;
   margin: 0;
 }
+
+/* 已消失环境（缓存命中但路径不存在）：标灰降透明度，提示用户该环境已卸载/移动 */
+.home-row.is-missing { opacity: 0.55; }
+.home-row.is-missing code { text-decoration: line-through; }
