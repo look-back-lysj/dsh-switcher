@@ -846,11 +846,30 @@ function renderTmCurrent() {
 // ---------- 全局操作进度浮层 ----------
 let unlistenOpProgress = null;
 const opOverlay = () => $("op-progress-overlay");
+// 耗时操作进行中需要禁用的按钮选择器（操作互斥，防止并发触发）。
+const OP_MUTEX_SELECTORS = [
+  '#deep-scan', '#rescan', '#start-backup', '#execute-restore',
+  '#switch-execute', '#undo-last', '#export-backup', '#import-backup',
+];
+let opMutexDepth = 0; // 嵌套调用计数（归位会先备份再归位，属嵌套）
+
+function setOpButtonsDisabled(disabled) {
+  OP_MUTEX_SELECTORS.forEach((sel) => {
+    const el = document.querySelector(sel);
+    if (el) el.disabled = disabled;
+  });
+  // 接管/断开按钮是动态渲染的，用容器代理禁用
+  const homeList = $('home-list');
+  if (homeList) homeList.classList.toggle('op-busy', disabled);
+}
+
 function showOpProgress(title) {
   const o = opOverlay();
   if (!o) return;
   $("op-progress-title").textContent = title || "正在处理";
   o.hidden = false;
+  opMutexDepth += 1;
+  if (opMutexDepth === 1) setOpButtonsDisabled(true);
 }
 function updateOpProgress(done, total, current) {
   const bar = $("op-progress-bar");
@@ -863,6 +882,8 @@ function hideOpProgress() {
   if (o) o.hidden = true;
   const bar = $("op-progress-bar");
   if (bar) bar.style.transform = "scaleX(0)";
+  opMutexDepth = Math.max(0, opMutexDepth - 1);
+  if (opMutexDepth === 0) setOpButtonsDisabled(false);
 }
 async function setupOpProgressListener() {
   try {

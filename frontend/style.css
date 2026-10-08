@@ -1043,3 +1043,6 @@ input, textarea { caret-color: var(--color-primary); }
 
 /* prompt-dialog 输入框间距（复用全局 input/field 样式） */
 #prompt-dialog .field { margin-top: 14px; }
+
+/* 操作互斥：耗时操作进行中禁用 home-list 内的接管/断开按钮 */
+#home-list.op-busy { pointer-events: none; opacity: 0.7; }
