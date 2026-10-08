@@ -31,10 +31,15 @@ pub struct SessionVerification {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FrameRange {
-    #[allow(dead_code)]
     start: usize,
-    #[allow(dead_code)]
     end: usize,
+}
+
+impl FrameRange {
+    /// 帧起始字节偏移（供 routecheck 逐帧解压）
+    pub(crate) fn start(&self) -> usize { self.start }
+    /// 帧结束字节偏移（不含）
+    pub(crate) fn end(&self) -> usize { self.end }
 }
 
 /// 扫描拼接 zstd 帧的结构，不解压数据。

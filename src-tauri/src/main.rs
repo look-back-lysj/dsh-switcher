@@ -6,6 +6,7 @@ mod model;
 mod oplog;
 mod multiscan;
 mod repo;
+mod routecheck;
 mod scan_cache;
 mod scanner;
 mod export;
@@ -374,6 +375,11 @@ async fn switch_links(
     result
 }
 #[tauri::command]
+fn check_routability(target_home: String) -> Result<routecheck::RouteCheckReport, String> {
+    Ok(routecheck::check_routability(&PathBuf::from(target_home)))
+}
+
+#[tauri::command]
 fn list_rollback_ledgers(repo: String) -> Result<Vec<restore::RollbackLedgerEntry>, String> {
     restore::list_rollback_ledgers(&PathBuf::from(repo))
 }
@@ -538,6 +544,7 @@ fn main() {
             list_snapshots,
             undo_last,
             list_rollback_ledgers,
+            check_routability,
             preview_rollback_compensate,
             apply_rollback_compensate,
             export_backup,

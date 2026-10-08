@@ -21,6 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 fs_extra = "1"
 tokio-util = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+zstd = "0.13"
 
 [features]
 default = []

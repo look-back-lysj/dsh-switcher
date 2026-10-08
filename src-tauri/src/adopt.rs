@@ -809,6 +809,10 @@ pub struct SwitchResult {
     /// v4.1：凭据不会随切换迁移，前端据此弹重录提示。
     #[serde(default)]
     pub credential_note: bool,
+    /// v4.2 模块B：本次是否把源端 settings.yaml 带到了目标 home 根。
+    /// 这是"能看不能聊"的根治：模型提供方配置随切换走（API Key 仍不带）。
+    #[serde(default)]
+    pub settings_copied: bool,
 }
 
 /// 把 source_home 的内容切到 target_home：target 的 symlink 改指向 source 的仓库目录。
@@ -878,6 +882,12 @@ pub fn switch_links(
                 .map_err(|e| format!("备份目标的 {dir} 失败：{e}"))?;
         }
     }
+    // v4.2 模块B：目标 home 根的 settings.yaml 若存在，一并收进保险快照（回滚用）。
+    let tgt_settings = target_home.join("settings.yaml");
+    if tgt_settings.is_file() {
+        let dst = snap_root.join("home-settings.yaml");
+        fs::copy(&tgt_settings, &dst).map_err(|e| format!("备份目标端 settings.yaml 失败：{e}"))?;
+    }
 
     // 4. 复制式切换：把来源内容复制进目标自己的存档（链接不动，仍指向自己）
     let mut switched = 0u32;
@@ -928,6 +938,26 @@ pub fn switch_links(
         warnings.push("凭据（API Key）不会随切换迁移。若目标环境发不出消息，请在该版本设置里重新录入 API Key。".to_string());
     }
 
+    // v4.2 模块B：把源端 settings.yaml 复制到目标 home 根（不含任何密钥，只有提供方目录）。
+    // 依据本机实证：官方版启动时会把 legacy settings.yaml 自动导入并改名 .imported。
+    // 这是"能看不能聊"的根治：会话记住的模型路由（qiu005 等）在目标端才能解析到提供方。
+    let mut settings_copied = false;
+    let src_settings = source_home.join("settings.yaml");
+    if src_settings.is_file() {
+        let dst = target_home.join("settings.yaml");
+        // 目标已有 settings.yaml：已在上方保险快照收录为 home-settings.yaml，这里直接覆盖。
+        match fs::copy(&src_settings, &dst) {
+            Ok(_) => {
+                settings_copied = true;
+                details.push("settings.yaml 已随切换带过去（官方版重启后会自动导入）".to_string());
+                warnings.push("模型提供方配置已带过去，但 API Key 不在文件里（密钥环绑定）。若历史对话用的是自定义提供方，请在目标版本设置里重新粘贴对应 Key。".to_string());
+            }
+            Err(e) => {
+                warnings.push(format!("settings.yaml 复制失败（{e}）。目标端可能缺少模型提供方配置，部分历史对话会「能看不能聊」。"));
+            }
+        }
+    }
+
     // v4.1 模块④：skills 路径差异提示。
     // 同学排查报告 03.4 已证实：官方版实际用 ~/.agents\skills（共享库），
     // 而被接管/切换的是 <home>\skills，两套路径不一致会导致「切了 skills 但在官方版里看不到」。
@@ -956,6 +986,7 @@ pub fn switch_links(
         details,
         warnings,
         credential_note,
+        settings_copied,
     })
 }
 
@@ -1717,6 +1748,11 @@ mod tests {
         assert_eq!(b_old, b"B");
         // 保险快照名带"切自"
         assert!(result.backup_snapshot.contains("切自"), "快照名应含'切自': {}", result.backup_snapshot);
+        // v4.2 模块B：settings.yaml 从源 A 带到了目标 B 的 home 根
+        assert!(result.settings_copied, "源端有 settings.yaml，应被带过去");
+        assert!(home_b.join("settings.yaml").is_file(), "目标 B 根应有 settings.yaml");
+        // 目标 B 原 settings.yaml 应已进保险快照为 home-settings.yaml
+        assert!(snap.join("home-settings.yaml").is_file(), "保险快照应含目标原 settings.yaml");
 
         let _ = fs::remove_dir_all(&base);
     }
