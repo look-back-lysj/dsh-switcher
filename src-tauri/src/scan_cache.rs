@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// 缓存文件并发写保护：测试并行跑、GUI 多处同时触发扫描时，防止
+/// 「load→merge→save」窗口期被另一个线程的 save 插进来导致结果互相覆盖。
+static CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub const SCAN_CACHE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,8 +40,36 @@ fn now_string() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
+/// 增量合并保存：以旧缓存为基准，新扫到的更新/新增，旧有但本次未扫到的保留并标注。
+/// 解决「后台浅扫覆盖深扫正确结果」：浅扫扫不到深路径时，不会把深扫发现的条目删掉。
+/// 路径不存在的条目仍会在前端标灰（由 with_existence 负责）。
+pub fn merge_save(new_homes: &[DiscoveredHome], mode: &str) -> Result<(), String> {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut merged: Vec<DiscoveredHome> = new_homes.to_vec();
+    if let Some(old) = load() {
+        let new_paths: std::collections::HashSet<&str> = new_homes.iter().map(|h| h.path.as_str()).collect();
+        for old_home in old.homes {
+            if !new_paths.contains(old_home.path.as_str()) {
+                let mut kept = old_home.clone();
+                let note = format!("本次扫描未重新发现（上次由{}扫描发现），可能已移动或删除", old.last_scan_mode);
+                if !kept.warnings.iter().any(|w| w.contains("未重新发现")) {
+                    kept.warnings.push(note);
+                }
+                merged.push(kept);
+            }
+        }
+    }
+    save_locked(&merged, mode)
+}
+
 /// 保存扫描结果（覆盖写，原子落盘）。mode 传 "quick" 或 "deep"。
 pub fn save(homes: &[DiscoveredHome], mode: &str) -> Result<(), String> {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_locked(homes, mode)
+}
+
+/// 已持有 CACHE_LOCK 时的内部实现（merge_save 复用，避免同锁重入死锁）。
+fn save_locked(homes: &[DiscoveredHome], mode: &str) -> Result<(), String> {
     let dir = cache_path();
     fs::create_dir_all(&dir).map_err(|e| format!("创建缓存目录失败：{e}"))?;
     let cache = ScanCache {
@@ -49,8 +81,12 @@ pub fn save(homes: &[DiscoveredHome], mode: &str) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&cache).map_err(|e| format!("序列化缓存失败：{e}"))?;
     let final_path = dir.join("scan-cache.json");
     let tmp_path = dir.join("scan-cache.json.tmp");
-    fs::write(&tmp_path, json).map_err(|e| format!("写缓存临时文件失败：{e}"))?;
-    fs::rename(&tmp_path, &final_path).map_err(|e| format!("缓存落盘失败：{e}"))?;
+    fs::write(&tmp_path, &json).map_err(|e| format!("写缓存临时文件失败：{e}"))?;
+    if fs::rename(&tmp_path, &final_path).is_err() {
+        // Windows 上 rename 对已存在目标/杀软占用更挑剔，退化为 copy + remove
+        fs::copy(&tmp_path, &final_path).map_err(|e| format!("缓存落盘失败：{e}"))?;
+        let _ = fs::remove_file(&tmp_path);
+    }
     Ok(())
 }
 
@@ -79,6 +115,7 @@ pub fn with_existence(cache: &ScanCache) -> Vec<(DiscoveredHome, bool)> {
 
 /// 清除缓存（用户点「重新扫描」前 / 缓存损坏自愈时调用）。
 pub fn clear() {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ = fs::remove_file(cache_path().join("scan-cache.json"));
 }
 
@@ -89,7 +126,7 @@ mod tests {
 
     fn fake_home(path: &str) -> DiscoveredHome {
         DiscoveredHome {
-            id: "root-1".into(),
+            id: format!("id-{}", path),
             kind: HomeKind::DshHome,
             label: "测试".into(),
             path: path.into(),
@@ -103,19 +140,43 @@ mod tests {
     }
 
     #[test]
+    fn merge_save_keeps_missing_entries() {
+        // 并发安全：用本测试专属路径，不依赖全局 clear()，别的测试并发写不影响断言
+        let pid = std::process::id();
+        let deep = format!("C:\\m5-deep-{pid}");
+        let shallow = format!("C:\\m5-shallow-{pid}");
+        // 先存两个环境（模拟深扫发现）
+        save(&[fake_home(&deep), fake_home(&shallow)], "deep").unwrap();
+        // 浅扫只发现 shallow，deep 不应被删，而是保留并标注
+        merge_save(&[fake_home(&shallow)], "quick").unwrap();
+        // merge_save 结束后缓存必然已落盘（save_locked 内部完成），直接读
+        let loaded = load().expect("merge 后应能读回缓存");
+        let deep_only = loaded.homes.iter().find(|h| h.path == deep)
+            .expect("浅扫不应删掉深扫发现的条目");
+        assert!(deep_only.warnings.iter().any(|w| w.contains("未重新发现")), "应标注未重新发现");
+        // 再扫到 deep 时标注应被新结果覆盖（新结果无该 warning）
+        merge_save(&[fake_home(&shallow), fake_home(&deep)], "quick").unwrap();
+        let loaded2 = load().expect("再次 merge 后应能读回缓存");
+        let deep_only2 = loaded2.homes.iter().find(|h| h.path == deep)
+            .expect("deep 应仍在");
+        assert!(!deep_only2.warnings.iter().any(|w| w.contains("未重新发现")), "重新扫到后不应再标注");
+    }
+
+    #[test]
     fn save_then_load_roundtrip() {
-        let homes = vec![fake_home("C:\\nonexistent-dsh-home-xyz")];
-        save(&homes, "quick").expect("保存应成功");
+        let pid = std::process::id();
+        let path = format!("C:\\nonexistent-dsh-home-{pid}");
+        save(&[fake_home(&path)], "quick").expect("保存应成功");
         let loaded = load().expect("应能读回缓存");
         assert_eq!(loaded.version, SCAN_CACHE_VERSION);
         assert_eq!(loaded.last_scan_mode, "quick");
-        assert_eq!(loaded.homes.len(), 1);
-        assert_eq!(loaded.homes[0].path, "C:\\nonexistent-dsh-home-xyz");
+        let mine = loaded.homes.iter().find(|h| h.path == path)
+            .expect("应包含本测试写入的条目");
+        assert_eq!(mine.label, "测试");
         // existence 标注：不存在的路径应为 false
         let marked = with_existence(&loaded);
-        assert_eq!(marked.len(), 1);
-        assert!(!marked[0].1, "不存在的路径应标注为不存在");
-        clear();
-        assert!(load().is_none(), "清除后应读不到缓存");
+        let mine_marked = marked.iter().find(|(h, _)| h.path == path)
+            .expect("existence 标注应包含本测试条目");
+        assert!(!mine_marked.1, "不存在的路径应标注为不存在");
     }
 }

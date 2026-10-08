@@ -30,8 +30,8 @@ fn scan_homes() -> ScanResult {
     if let Some(agents) = scanner::discover_agents_home() {
         homes.push(agents);
     }
-    // 记录扫描结果（quick），失败不阻断返回
-    let _ = scan_cache::save(&homes, "quick");
+    // 记录扫描结果（quick），失败不阻断返回；增量合并防浅扫覆盖深扫
+    let _ = scan_cache::merge_save(&homes, "quick");
     ScanResult {
         homes,
         default_repo: default_repo(),
@@ -166,7 +166,7 @@ async fn deep_scan(deep: bool, cancel: tauri::State<'_, CancellationToken>) -> R
     .await
     .unwrap_or_else(|_| ScanResult { homes: Vec::new(), default_repo: default_repo() });
     // 记录扫描结果：deep 记 "deep"，quick 记 "quick"，失败不阻断返回
-    let _ = scan_cache::save(&result.homes, if deep { "deep" } else { "quick" });
+    let _ = scan_cache::merge_save(&result.homes, if deep { "deep" } else { "quick" });
     oplog::record("scan", "", if deep { "深度扫描" } else { "快速扫描" },
         &format!("识别到 {} 个环境", result.homes.len()), "ok", "");
     Ok(result)
@@ -401,8 +401,8 @@ fn print_scan_json() {
     if let Some(agents) = scanner::discover_agents_home() {
         homes.push(agents);
     }
-    // CLI 与 GUI 一致：扫描结果写缓存
-    let _ = scan_cache::save(&homes, "quick");
+    // CLI 与 GUI 一致：扫描结果写缓存（增量合并）
+    let _ = scan_cache::merge_save(&homes, "quick");
     println!("{}", serde_json::to_string_pretty(&ScanResult { homes, default_repo: default_repo() }).expect("序列化扫描结果失败"));
 }
 
@@ -489,7 +489,7 @@ fn main() {
             let quick = !args.iter().any(|v| v == "--deep");
             let t = std::time::Instant::now();
             let homes = multiscan::multi_scan(quick);
-            let _ = scan_cache::save(&homes, if quick { "quick" } else { "deep" });
+            let _ = scan_cache::merge_save(&homes, if quick { "quick" } else { "deep" });
             let out = serde_json::json!({
                 "elapsed_ms": t.elapsed().as_millis(),
                 "count": homes.len(),
