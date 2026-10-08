@@ -39,8 +39,10 @@ fn get_catalog(repo: String) -> Result<repo::Manifest, String> {
 }
 
 #[tauri::command]
-fn backup(app: tauri::AppHandle, repo: String, note: String, only_config: bool) -> Result<repo::BackupResult, String> {
-    run_backup(&repo, &note, only_config, Some(&app))
+async fn backup(app: tauri::AppHandle, repo: String, note: String, only_config: bool) -> Result<repo::BackupResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_backup(&repo, &note, only_config, Some(&app)))
+        .await
+        .map_err(|e| format!("备份任务中断：{e}"))?
 }
 
 #[tauri::command]
@@ -49,7 +51,7 @@ fn verify(repo: String) -> Result<restore::VerifyResult, String> {
 }
 
 #[tauri::command]
-fn preview_restore(
+async fn preview_restore(
     repo: String,
     scope: RestoreScope,
     source_home_id: Option<String>,
@@ -58,19 +60,23 @@ fn preview_restore(
     project: Option<String>,
     mode: RestoreMode,
 ) -> Result<restore::RestorePreview, String> {
-    preview_restore_impl(&PathBuf::from(repo), restore::RestoreFilter {
-        scope,
-        source_home_id,
-        target_home,
-        ids,
-        mode,
-        project,
-        since: None,
+    tauri::async_runtime::spawn_blocking(move || {
+        preview_restore_impl(&PathBuf::from(repo), restore::RestoreFilter {
+            scope,
+            source_home_id,
+            target_home,
+            ids,
+            mode,
+            project,
+            since: None,
+        })
     })
+    .await
+    .map_err(|e| format!("预览任务中断：{e}"))?
 }
 
 #[tauri::command]
-fn restore(app: tauri::AppHandle,
+async fn restore(app: tauri::AppHandle,
     repo: String,
     scope: RestoreScope,
     source_home_id: Option<String>,
@@ -79,15 +85,19 @@ fn restore(app: tauri::AppHandle,
     project: Option<String>,
     mode: RestoreMode,
 ) -> Result<restore::RestoreResult, String> {
-    run_restore_impl(&PathBuf::from(repo), restore::RestoreFilter {
-        scope,
-        source_home_id,
-        target_home,
-        ids,
-        project,
-        mode,
-        since: None,
-    }, Some(&app))
+    tauri::async_runtime::spawn_blocking(move || {
+        run_restore_impl(&PathBuf::from(repo), restore::RestoreFilter {
+            scope,
+            source_home_id,
+            target_home,
+            ids,
+            project,
+            mode,
+            since: None,
+        }, Some(&app))
+    })
+    .await
+    .map_err(|e| format!("恢复任务中断：{e}"))?
 }
 
 #[tauri::command]
@@ -103,16 +113,20 @@ fn import_backup(archive: String, repo: String) -> Result<export::ImportResult, 
 // ===================== v3：接管 / 切换 / 深度扫描 =====================
 
 #[tauri::command]
-fn deep_scan(deep: bool) -> ScanResult {
-    // 多算法融合扫描：quick=快速（常见位置深度3），deep=全盘（所有固定盘深度5）
-    let mut homes = multiscan::multi_scan(!deep);
-    if let Some(agents) = scanner::discover_agents_home() {
-        homes.push(agents);
-    }
-    ScanResult {
-        homes,
-        default_repo: default_repo(),
-    }
+async fn deep_scan(deep: bool) -> ScanResult {
+    // 多算法融合扫描放进阻塞线程池，避免遍历目录时冻结 IPC/WebView。
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut homes = multiscan::multi_scan(!deep);
+        if let Some(agents) = scanner::discover_agents_home() {
+            homes.push(agents);
+        }
+        ScanResult {
+            homes,
+            default_repo: default_repo(),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| ScanResult { homes: Vec::new(), default_repo: default_repo() })
 }
 
 #[tauri::command]
@@ -121,13 +135,21 @@ fn check_dsh_running() -> Vec<String> {
 }
 
 #[tauri::command]
-fn adopt_home(app: tauri::AppHandle, repo: String, home_path: String, note: String) -> Result<adopt::AdoptResult, String> {
-    adopt::adopt_home_with_progress(&PathBuf::from(repo), &PathBuf::from(home_path), &note, Some(&app))
+async fn adopt_home(app: tauri::AppHandle, repo: String, home_path: String, note: String) -> Result<adopt::AdoptResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        adopt::adopt_home_with_progress(&PathBuf::from(repo), &PathBuf::from(home_path), &note, Some(&app))
+    })
+    .await
+    .map_err(|e| format!("接管任务中断：{e}"))?
 }
 
 #[tauri::command]
-fn unadopt_home(repo: String, home_path: String) -> Result<adopt::UnadoptResult, String> {
-    adopt::unadopt_home(&PathBuf::from(repo), &PathBuf::from(home_path))
+async fn unadopt_home(repo: String, home_path: String) -> Result<adopt::UnadoptResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        adopt::unadopt_home(&PathBuf::from(repo), &PathBuf::from(home_path))
+    })
+    .await
+    .map_err(|e| format!("断开接管任务中断：{e}"))?
 }
 
 #[derive(Debug, Serialize)]
@@ -157,8 +179,12 @@ fn preview_repair(repo: String, home_path: String) -> Result<adopt::RepairPrevie
 }
 
 #[tauri::command]
-fn repair_links(repo: String, home_path: String) -> Result<adopt::RepairResult, String> {
-    adopt::repair_links(&PathBuf::from(repo), &PathBuf::from(home_path))
+async fn repair_links(repo: String, home_path: String) -> Result<adopt::RepairResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        adopt::repair_links(&PathBuf::from(repo), &PathBuf::from(home_path))
+    })
+    .await
+    .map_err(|e| format!("修复任务中断：{e}"))?
 }
 
 #[tauri::command]
@@ -172,7 +198,7 @@ fn repair_partial(repo: String, home_path: String) -> Result<Vec<String>, String
 }
 
 #[tauri::command]
-fn switch_links(
+async fn switch_links(
     repo: String,
     source_home: String,
     target_home: String,
@@ -181,15 +207,19 @@ fn switch_links(
     include_config: bool,
     include_memories: bool,
 ) -> Result<adopt::SwitchResult, String> {
-    adopt::switch_links(
-        &PathBuf::from(repo),
-        &PathBuf::from(source_home),
-        &PathBuf::from(target_home),
-        include_sessions,
-        include_skills,
-        include_config,
-        include_memories,
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        adopt::switch_links(
+            &PathBuf::from(repo),
+            &PathBuf::from(source_home),
+            &PathBuf::from(target_home),
+            include_sessions,
+            include_skills,
+            include_config,
+            include_memories,
+        )
+    })
+    .await
+    .map_err(|e| format!("切换任务中断：{e}"))?
 }
 #[tauri::command]
 fn list_rollback_ledgers(repo: String) -> Result<Vec<restore::RollbackLedgerEntry>, String> {
