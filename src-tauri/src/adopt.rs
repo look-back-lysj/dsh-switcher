@@ -226,6 +226,21 @@ pub struct AdoptRecord {
     pub manifest: std::collections::HashMap<String, String>,
 }
 
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{} B", n)
+    }
+}
+
 fn now_string() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
@@ -489,6 +504,16 @@ pub fn adopt_home_with_progress(
     let cap = check_link_capability(home_path);
     if !cap.junction_ok && !cap.symlink_ok {
         return Err(cap.advice);
+    }
+    // 1.6 磁盘空间检查：跨盘移动需要 home 与仓库双方都有足够空间（预估 ×2 保险）。
+    if let (Some(free), need) = (disk_free_bytes(repo), estimate_adopt_bytes(home_path).saturating_mul(2)) {
+        if need > 0 && free < need {
+            return Err(format!(
+                "磁盘空间不足：接管预计需要 {}（含保险余量），但仓库所在盘仅剩 {}。请清理磁盘或更换仓库位置后重试。",
+                format_bytes(need),
+                format_bytes(free)
+            ));
+        }
     }
     // 2. 半完成状态自愈：历史接管中断会把目录搬进仓库但没建链接，先还原再继续。
     if let Some(partial) = detect_partial_adoption(repo, home_path) {
@@ -1213,6 +1238,46 @@ fn rollback_partial(files_root: &Path, home_path: &Path, links: &[LinkMapping], 
             }
         }
     }
+}
+
+/// 查询指定路径所在盘的可用字节数。
+#[cfg(windows)]
+pub fn disk_free_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free as *mut u64,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 { Some(free) } else { None }
+}
+
+#[cfg(not(windows))]
+pub fn disk_free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// 预估待接管目录的总字节数（sessions/skills 等小目录，不含 profiles）。
+pub fn estimate_adopt_bytes(home_path: &Path) -> u64 {
+    let mut total = 0u64;
+    for dir in ADOPT_DIRS {
+        let d = home_path.join(dir);
+        if !d.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&d).follow_links(false).into_iter().filter_map(Result::ok) {
+            if entry.file_type().is_file() {
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    total
 }
 
 /// 链接能力预检：能否在当前权限下创建目录链接（junction 免管理员）。

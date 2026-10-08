@@ -195,7 +195,16 @@ async function loadScanCache() {
       return h;
     });
     // defaultRepo 由随后的 scan() 填充；先给缓存时间戳
-    if ($('scan-time')) $('scan-time').textContent = `缓存 ${res.lastScanAt}（后台刷新中…）`;
+    // 缓存超过 7 天未刷新 → 顶部提示建议重扫
+    let staleNote = '';
+    try {
+      const ageMs = Date.now() - new Date(res.lastScanAt).getTime();
+      if (ageMs > 7 * 24 * 3600 * 1000) {
+        const days = Math.floor(ageMs / (24 * 3600 * 1000));
+        staleNote = `（已 ${days} 天未刷新，建议点「重新扫描」）`;
+      }
+    } catch (e) {}
+    if ($('scan-time')) $('scan-time').textContent = `缓存 ${res.lastScanAt}${staleNote}（后台刷新中…）`;
     renderEnvironment();
     fillHomeSelects();
     return true;
@@ -980,6 +989,7 @@ async function doAdopt(homePath) {
     await refreshAdoptStatus();
     renderEnvironment();
     await checkMismatch();
+    backgroundRescan(); // 接管后后台刷新缓存
   } catch (e) {
     showResult($('env-result'), `接管失败：${e.message}`, true);
   }
@@ -1012,9 +1022,26 @@ async function doUnadopt(homePath) {
     await refreshAdoptStatus();
     renderEnvironment();
     await checkMismatch();
+    backgroundRescan(); // 断开接管后后台刷新缓存
   } catch (e) {
     showResult($('env-result'), `断开接管失败：${e.message}`, true);
   }
+}
+
+// 操作成功后后台静默刷新扫描缓存（不阻塞用户、不显示 busy 状态）。
+function backgroundRescan() {
+  try { scan_silent(); } catch (e) {}
+}
+
+async function scan_silent() {
+  try {
+    const result = await invoke('scan_homes');
+    state.homes = result.homes;
+    state.defaultRepo = result.defaultRepo;
+    await refreshAdoptStatus();
+    renderEnvironment();
+    fillHomeSelects();
+  } catch (e) { /* 后台刷新失败不影响当前操作 */ }
 }
 
 async function deepScan() {
@@ -1246,6 +1273,7 @@ async function doSwitch() {
     showResult($('switch-result'), `切换完成：${result.switchedLinks} 类内容已从「${s?.label}」切到「${t?.label}」。目标环境的原内容已存入保险快照「${result.backupSnapshot}」。`, false);
     await renderSwitch();
     updateSwitchRoute();
+    backgroundRescan(); // 切换后后台刷新缓存
   } catch (e) {
     showResult($('switch-result'), `切换失败：${e.message}`, true);
   } finally {
