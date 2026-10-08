@@ -419,9 +419,10 @@ fn switch_preflight(repo: String, source_home: String, target_home: String) -> R
 }
 
 #[tauri::command]
-async fn fix_presets_now(target_home: String) -> Result<preset_fix::PresetFixReport, String> {
+async fn fix_presets_now(repo: String, target_home: String) -> Result<preset_fix::PresetFixReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        preset_fix::fix_unknown_presets(&PathBuf::from(target_home))
+        let adapters = adapters::Adapters::load(&PathBuf::from(repo));
+        preset_fix::fix_unknown_presets(&PathBuf::from(target_home), &adapters)
     })
     .await
     .map_err(|e| format!("修复任务中断：{e}"))

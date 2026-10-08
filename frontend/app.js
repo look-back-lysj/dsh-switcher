@@ -1570,7 +1570,7 @@ async function doFixPresets() {
   if (!bar || !bar.dataset.target) return;
   try {
     const report = await withOpProgress('正在修复对话预设', () =>
-      invoke('fix_presets_now', { targetHome: bar.dataset.target }));
+      invoke('fix_presets_now', { repo: state.defaultRepo, targetHome: bar.dataset.target }));
     bar.hidden = true;
     const note = (report.notes && report.notes.join(' ')) || `已修复 ${report.rewritten} 条对话的预设。`;
     showResult($('switch-result'), note + ' 现在可以正常继续这些对话了。', false);

@@ -20,10 +20,8 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
-/// 目标端认识的预设白名单（官方内置）。不在名单里的预设名会被重写。
-/// standard 是官方默认（asar 注册表 default: standard），作为重写落点。
-const KNOWN_PRESETS: &[&str] = &["standard", "code", "ptc", "ask", "architect"];
-const FALLBACK_PRESET: &str = "standard";
+// v5：白名单与落点改由 adapters.json 规则表提供（不再硬编码，新版本只加规则不改码）。
+// 保留常量仅作测试兜底；运行路径一律走 Adapters。
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,7 +46,7 @@ fn header_preset(header_line: &str) -> Option<String> {
 
 /// 处理单个会话文件：若首帧 header 的 agentPreset 不在白名单，重写首帧。
 /// 后续帧原样字节保留。返回 Ok((是否改写, 原预设名))。
-fn fix_session_file(path: &Path) -> Result<(bool, Option<String>), String> {
+fn fix_session_file(path: &Path, adapters: &crate::adapters::Adapters) -> Result<(bool, Option<String>), String> {
     let bytes = fs::read(path).map_err(|e| format!("读取失败：{e}"))?;
     let (frames, _torn) = crate::zstd_check::scan_frames(&bytes)?;
     if frames.is_empty() {
@@ -64,9 +62,10 @@ fn fix_session_file(path: &Path) -> Result<(bool, Option<String>), String> {
     let Some(preset) = header_preset(&first_line) else {
         return Ok((false, None)); // header 无 preset 字段，无需改
     };
-    if KNOWN_PRESETS.contains(&preset.as_str()) {
+    if adapters.is_known_preset(&preset) {
         return Ok((false, Some(preset))); // 已合法
     }
+    let mapped_preset = adapters.map_preset(&preset);
 
     // 重写首帧：只替换 header 行里的预设值（精确替换 "agentPreset":"X"）
     let needle = format!("\"agentPreset\":\"{}\"", preset);
@@ -76,10 +75,10 @@ fn fix_session_file(path: &Path) -> Result<(bool, Option<String>), String> {
         if !first_line.contains(&needle2) {
             return Ok((false, Some(preset))); // 找不到精确字段，不改，保安全
         }
-        let new_line = first_line.replace(&needle2, &format!("\"agentPreset\": \"{}\"", FALLBACK_PRESET));
+        let new_line = first_line.replace(&needle2, &format!("\"agentPreset\": \"{}\"", mapped_preset));
         return write_rewritten(path, &bytes, first, &header_text, &first_line, &new_line, preset);
     }
-    let new_line = first_line.replace(&needle, &format!("\"agentPreset\":\"{}\"", FALLBACK_PRESET));
+    let new_line = first_line.replace(&needle, &format!("\"agentPreset\":\"{}\"", mapped_preset));
     write_rewritten(path, &bytes, first, &header_text, &first_line, &new_line, preset)
 }
 
@@ -114,7 +113,7 @@ fn write_rewritten(
 
 /// 扫描目标 home 的 sessions，把所有不在白名单的 agentPreset 重写成 standard。
 /// 时机：切换复制 sessions 完成后调用（此时目标端已是源端内容）。
-pub fn fix_unknown_presets(target_home: &Path) -> PresetFixReport {
+pub fn fix_unknown_presets(target_home: &Path, adapters: &crate::adapters::Adapters) -> PresetFixReport {
     let mut report = PresetFixReport {
         scanned: 0,
         rewritten: 0,
@@ -139,7 +138,7 @@ pub fn fix_unknown_presets(target_home: &Path) -> PresetFixReport {
             || (name.starts_with("session.v") && name.ends_with(".jsonl.zstd"));
         if !is_session { continue; }
         report.scanned += 1;
-        match fix_session_file(entry.path()) {
+        match fix_session_file(entry.path(), adapters) {
             Ok((true, Some(p))) => {
                 report.rewritten += 1;
                 *from_map.entry(p).or_insert(0) += 1;
@@ -188,7 +187,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dsh-pf-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let f = make_session(&dir, "anchored-standard");
-        let (rewritten, from) = fix_session_file(&f).unwrap();
+        let (rewritten, from) = fix_session_file(&f, &crate::adapters::Adapters::default()).unwrap();
         assert!(rewritten);
         assert_eq!(from.as_deref(), Some("anchored-standard"));
         // 改后首帧 header 是 standard
@@ -210,7 +209,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let f = make_session(&dir, "standard");
         let orig = fs::read(&f).unwrap();
-        let (rewritten, _) = fix_session_file(&f).unwrap();
+        let (rewritten, _) = fix_session_file(&f, &crate::adapters::Adapters::default()).unwrap();
         assert!(!rewritten, "standard 已合法，不应改写");
         assert_eq!(fs::read(&f).unwrap(), orig, "文件不应变动");
         let _ = fs::remove_dir_all(&dir);

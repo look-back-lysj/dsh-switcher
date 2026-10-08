@@ -818,6 +818,64 @@ pub struct SwitchResult {
     pub preset_fixed: u32,
 }
 
+/// v5 模块三：为保险快照生成 manifest（rel → sha256 + size），回滚校验用。
+fn build_snapshot_manifest(snap_root: &Path) -> serde_json::Value {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(snap_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() { continue; }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "manifest.json" { continue; }
+        let rel = entry.path().strip_prefix(snap_root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
+        let (mut sha, mut size) = (String::new(), 0u64);
+        if let Ok(bytes) = fs::read(entry.path()) {
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            sha = format!("{:x}", h.finalize());
+            size = bytes.len() as u64;
+        }
+        files.push(serde_json::json!({ "rel": rel, "sha256": sha, "size": size }));
+    }
+    serde_json::json!({ "version": 1, "fileCount": files.len(), "files": files })
+}
+
+/// v5 模块三：回滚前校验保险快照完整性（manifest 里的每个文件都在且哈希一致）。
+/// 返回 (总文件数, 缺失/损坏数, 问题描述)。
+pub fn verify_snapshot_integrity(snap_root: &Path) -> (usize, usize, Vec<String>) {
+    let manifest_file = snap_root.join("manifest.json");
+    let Ok(text) = fs::read_to_string(&manifest_file) else {
+        return (0, 0, vec!["快照无 manifest（旧版快照），跳过校验".to_string()]);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (0, 0, vec!["manifest 损坏，跳过校验".to_string()]);
+    };
+    let mut total = 0usize;
+    let mut bad = 0usize;
+    let mut issues = Vec::new();
+    if let Some(arr) = v.get("files").and_then(|f| f.as_array()) {
+        for f in arr {
+            total += 1;
+            let rel = f.get("rel").and_then(|x| x.as_str()).unwrap_or("");
+            let expected = f.get("sha256").and_then(|x| x.as_str()).unwrap_or("");
+            let path = snap_root.join(rel.replace('/', "\\"));
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    let mut h = Sha256::new();
+                    h.update(&bytes);
+                    if format!("{:x}", h.finalize()) != expected {
+                        bad += 1;
+                        issues.push(format!("{} 哈希不符", rel));
+                    }
+                }
+                Err(_) => {
+                    bad += 1;
+                    issues.push(format!("{} 缺失", rel));
+                }
+            }
+        }
+    }
+    (total, bad, issues)
+}
+
 /// v4.2 模块F：一键回滚到"切换前"。
 /// 把最近一次保险快照的内容写回目标端自己的存档（链接不动），凭据文件硬跳过。
 
@@ -877,6 +935,14 @@ pub fn rollback_switch(repo: &Path, target_home: &Path, snapshot_name: &str) -> 
     let snap_root = repo.join("switch-backups").join(&tgt_id).join(snapshot_name);
     if !snap_root.is_dir() {
         return Err(format!("保险快照不存在：{snapshot_name}"));
+    }
+    // v5 模块三：回滚前校验快照完整性，损坏则拒绝（防止回滚出半残环境）。
+    let (total, bad, issues) = verify_snapshot_integrity(&snap_root);
+    if bad > 0 {
+        return Err(format!(
+            "保险快照已损坏（{} 个文件中 {} 个有问题），为安全起见已取消回滚。{}",
+            total, bad, issues.first().map(|s| format!(" 例：{}", s)).unwrap_or_default()
+        ));
     }
 
     // 1. 回滚前自保：把目标端当前内容存一份，防回滚错方向。
@@ -1194,6 +1260,11 @@ pub fn switch_links(
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::json!({"snapshots": []}));
     let file_count = count_files(&snap_root);
+    // v5 模块三：给保险快照生成 manifest（每文件 sha256），回滚时据此校验完整性。
+    let snap_manifest = build_snapshot_manifest(&snap_root);
+    if let Ok(text) = serde_json::to_string(&snap_manifest) {
+        let _ = fs::write(snap_root.join("manifest.json"), text);
+    }
     index["snapshots"].as_array_mut().map(|arr| {
         arr.push(serde_json::json!({
             "name": snap_name,
@@ -1261,7 +1332,8 @@ pub fn switch_links(
     // 根治"Unknown agent preset: anchored-standard"——用户截图实证这是 resume 失败的直接原因。
     let mut preset_fixed_count = 0u32;
     if include_sessions {
-        let report = crate::preset_fix::fix_unknown_presets(target_home);
+        let adapters = crate::adapters::Adapters::load(repo);
+        let report = crate::preset_fix::fix_unknown_presets(target_home, &adapters);
         preset_fixed_count = report.rewritten;
         if report.rewritten > 0 {
             details.push(report.notes.join(" "));
@@ -2187,6 +2259,41 @@ mod tests {
         let body_dec = zstd::decode_all(std::io::Cursor::new(&written[frames[1].start()..frames[1].end()])).unwrap();
         assert!(String::from_utf8_lossy(&body_dec).contains("user/message"));
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn e2e_snapshot_manifest_and_verify() {
+        // 模块三：切换快照含 manifest，完整性校验能发现损坏
+        let base = std::env::temp_dir().join(format!("dsh-vault-snapm-{}", uuid::Uuid::new_v4()));
+        let repo = base.join("repo");
+        let home_a = base.join("homeA");
+        fs::create_dir_all(home_a.join("sessions").join("pA").join("s1")).unwrap();
+        fs::write(home_a.join("sessions").join("pA").join("s1").join("session.jsonl.zstd"), b"A").unwrap();
+        fs::write(home_a.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        let home_b = base.join("homeB");
+        fs::create_dir_all(home_b.join("sessions").join("pB").join("s2")).unwrap();
+        fs::write(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd"), b"B").unwrap();
+        fs::write(home_b.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        adopt_home(&repo, &home_a, "A").unwrap();
+        adopt_home(&repo, &home_b, "B").unwrap();
+
+        let result = switch_links(&repo, &home_a, &home_b, true, false, false, false, false).unwrap();
+        let snap = repo.join("switch-backups").join(home_id_of(&home_b)).join(&result.backup_snapshot);
+        // manifest 存在
+        assert!(snap.join("manifest.json").is_file(), "快照应含 manifest");
+        // 完整性校验通过
+        let (total, bad, _) = verify_snapshot_integrity(&snap);
+        assert!(total > 0, "manifest 应有文件");
+        assert_eq!(bad, 0, "完好快照不应有损坏");
+        // 人为破坏一个文件 → 校验发现 → 回滚拒绝
+        let victim = snap.join("sessions").join("pB").join("s2").join("session.jsonl.zstd");
+        fs::write(&victim, b"CORRUPTED").unwrap();
+        let (_, bad2, _) = verify_snapshot_integrity(&snap);
+        assert!(bad2 > 0, "损坏应被发现");
+        let rb = rollback_switch(&repo, &home_b, &result.backup_snapshot);
+        assert!(rb.is_err(), "损坏快照应拒绝回滚");
         let _ = fs::remove_dir_all(&base);
     }
 
