@@ -28,6 +28,9 @@
         <button class="nav-item" data-view="switch" type="button">
           <span>切换</span><small>环境互换</small>
         </button>
+        <button class="nav-item" data-view="logs" type="button">
+          <span>日志</span><small>排障报告</small>
+        </button>
       </nav>
       <div class="sidebar-note">
         <strong>默认仓库</strong>
@@ -349,6 +352,32 @@
             <div class="progress-track"><div class="progress-bar" id="restore-progress-bar"></div></div>
             <div class="progress-file" id="restore-progress-file">正在准备…</div>
           </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-logs" aria-labelledby="logs-title">
+        <header class="page-header">
+          <div>
+            <h2 id="logs-title">操作日志</h2>
+            <p>这里记录本工具做过的每一次扫描、备份、接管、切换与恢复。遇到问题时，一键导出报告发给帮你排查的人，不用自己回忆「我点了什么」。</p>
+          </div>
+          <button class="button" id="refresh-oplogs" type="button">刷新</button>
+        </header>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h3>最近操作</h3>
+            <span class="muted" id="oplog-summary">—</span>
+          </div>
+          <div class="oplog-actions">
+            <button class="button primary" id="export-oplogs" type="button">导出排障报告（Markdown）</button>
+            <button class="button" id="clear-oplogs" type="button">清空日志</button>
+          </div>
+          <p class="muted oplog-note">日志只记录操作类型、环境与数量摘要，<strong>不包含任何 API Key 或凭据内容</strong>。报告可直接发给协助排障的人。</p>
+          <div class="oplog-list" id="oplog-list">
+            <div class="empty-state"><strong>还没有操作记录。</strong><br>做过一次扫描或备份后，这里会出现记录。</div>
+          </div>
+          <div class="result" id="logs-result" hidden></div>
         </div>
       </section>
 

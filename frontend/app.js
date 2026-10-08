@@ -623,17 +623,6 @@ async function undo() {
     showResult($('repo-result'), `撤回失败：${error.message}`, true);
   }
 }
-  const dismiss = document.getElementById('dismiss-onboarding');
-  if (dismiss) dismiss.addEventListener('click', () => {
-    document.getElementById('onboarding').hidden = true;
-    localStorage.setItem('dsh-vault-onboarding-dismissed', '1');
-  });
-  if (localStorage.getItem('dsh-vault-onboarding-dismissed') === '1') {
-    document.getElementById('onboarding').hidden = true;
-  }
-
-
-
 // ===== 时光机 =====
 let tmSnapshots = [];
 let tmSelectedSnapshot = null;
@@ -1092,6 +1081,65 @@ async function deepScan() {
 
 
 
+// ---------- 操作日志 ----------
+const OP_LABELS = {
+  scan: '扫描', backup: '备份', restore: '恢复', adopt: '接管', unadopt: '断开接管',
+  switch: '切换', repair: '修复', export: '导出', import: '导入', undo: '撤回', verify: '校验',
+};
+
+function renderOpLogs(entries, sizeBytes) {
+  const list = $('oplog-list');
+  const summary = $('oplog-summary');
+  if (summary) summary.textContent = `${entries.length} 条 · ${formatBytes(sizeBytes)}`;
+  if (!entries || !entries.length) {
+    list.innerHTML = '<div class="empty-state"><strong>还没有操作记录。</strong><br>做过一次扫描或备份后，这里会出现记录。</div>';
+    return;
+  }
+  list.innerHTML = entries.map((e) => {
+    const op = OP_LABELS[e.op] || e.op;
+    const badge = e.status === 'ok' ? '成功' : (e.status === 'fail' ? '失败' : '警告');
+    const tone = e.status === 'ok' ? 'ok' : (e.status === 'fail' ? 'fail' : 'warn');
+    const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    return `
+      <div class="oplog-item">
+        <span class="oplog-time">${esc(e.time)}</span>
+        <span class="oplog-op">${esc(op)}</span>
+        <div class="oplog-main">
+          <span class="subject">${esc(e.subject || '—')}</span>
+          ${e.detail ? `<span class="detail">${esc(e.detail)}</span>` : ''}
+        </div>
+        <span class="oplog-badge ${tone}">${badge}</span>
+        ${e.error ? `<div class="oplog-error">${esc(e.error)}</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+async function refreshOpLogs() {
+  try {
+    const res = await invoke('list_op_logs');
+    renderOpLogs(res.entries || [], res.sizeBytes || 0);
+  } catch (e) {
+    const list = $('oplog-list');
+    if (list) list.innerHTML = `<div class="empty-state"><strong>读取日志失败。</strong><br>${e.message || e}</div>`;
+  }
+}
+
+async function exportOpLogs() {
+  const btn = $('export-oplogs');
+  const target = await selectSaveFile('导出排障报告', [{ name: 'Markdown 报告', extensions: ['md'] }]);
+  if (!target) return;
+  const path = target.toLowerCase().endsWith('.md') ? target : `${target}.md`;
+  setBusy(btn, true, '导出中…');
+  try {
+    const written = await invoke('export_op_logs', { target: path });
+    showResult($('logs-result'), `报告已导出：${written}`, false);
+  } catch (e) {
+    showResult($('logs-result'), `导出失败：${e.message || e}`, true);
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
 // ---------- MCP 接入配置 ----------
 function renderMcpConfig() {
   const el = $("mcp-config-text");
@@ -1329,6 +1377,19 @@ function bindNavigation() {
 document.addEventListener('DOMContentLoaded', async () => {
   bindNavigation();
   setupProgressListeners();
+  // 新手引导「知道了」：关闭并记住（原先这段代码误落在 undo() 函数体内，永远执行不到）。
+  const dismissOnb = document.getElementById('dismiss-onboarding');
+  if (dismissOnb) dismissOnb.addEventListener('click', () => {
+    const onb = document.getElementById('onboarding');
+    if (onb) onb.hidden = true;
+    try { localStorage.setItem('dsh-vault-onboarding-dismissed', '1'); } catch (e) {}
+  });
+  try {
+    if (localStorage.getItem('dsh-vault-onboarding-dismissed') === '1') {
+      const onb = document.getElementById('onboarding');
+      if (onb) onb.hidden = true;
+    }
+  } catch (e) {}
   // 先秒读缓存显示上次结果，再触发 scan() 后台刷新（见文件末尾）
   await loadScanCache();
   setupOpProgressListener();
@@ -1395,6 +1456,23 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // v3：环境页
   $('deep-scan').addEventListener('click', deepScan);
+  // 日志页
+  $('refresh-oplogs')?.addEventListener('click', refreshOpLogs);
+  $('export-oplogs')?.addEventListener('click', exportOpLogs);
+  $('clear-oplogs')?.addEventListener('click', async () => {
+    const ok = await confirmDialog({
+      title: '清空操作日志',
+      message: '将删除本机保存的全部操作记录。此操作不影响任何备份与环境文件，只是清空日志。',
+      items: ['日志清空后无法再导出历史排障报告。'],
+      confirmText: '确认清空',
+    });
+    if (!ok) return;
+    try { await invoke('clear_op_logs'); await refreshOpLogs(); } catch (e) {}
+  });
+  // 进入日志页时刷新
+  document.querySelector('.nav-item[data-view="logs"]')?.addEventListener('click', () => {
+    setTimeout(refreshOpLogs, 0);
+  });
   $('cancel-scan')?.addEventListener('click', async () => {
     try { await invoke('cancel_operation'); } catch (e) {}
   });

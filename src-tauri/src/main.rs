@@ -3,6 +3,7 @@
 mod adopt;
 mod mcp;
 mod model;
+mod oplog;
 mod multiscan;
 mod repo;
 mod scan_cache;
@@ -44,6 +45,21 @@ fn get_catalog(repo: String) -> Result<repo::Manifest, String> {
 
 #[tauri::command]
 async fn backup(app: tauri::AppHandle, repo: String, note: String, only_config: bool) -> Result<repo::BackupResult, String> {
+    let repo_for_log = repo.clone();
+    let only_cfg = only_config;
+    let result = backup_inner(app, repo, note, only_config).await;
+    match &result {
+        Ok(r) => oplog::record("backup", &repo_for_log, &format!("{} 个环境", r.homes),
+            &format!("文件 {}（新增 {} 复用 {}）/ {}", r.files, r.created, r.skipped, crate::adopt::format_bytes_pub(r.bytes)),
+            "ok", ""),
+        Err(e) => oplog::record("backup", &repo_for_log, "", "", "fail",
+            &e.chars().take(200).collect::<String>()),
+    }
+    let _ = only_cfg;
+    result
+}
+
+async fn backup_inner(app: tauri::AppHandle, repo: String, note: String, only_config: bool) -> Result<repo::BackupResult, String> {
     tauri::async_runtime::spawn_blocking(move || run_backup(&repo, &note, only_config, Some(&app)))
         .await
         .map_err(|e| format!("备份任务中断：{e}"))?
@@ -89,7 +105,9 @@ async fn restore(app: tauri::AppHandle,
     project: Option<String>,
     mode: RestoreMode,
 ) -> Result<restore::RestoreResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let repo_log = repo.clone();
+    let tgt_log = target_home.clone().unwrap_or_default();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         run_restore_impl(&PathBuf::from(repo), restore::RestoreFilter {
             scope,
             source_home_id,
@@ -101,12 +119,26 @@ async fn restore(app: tauri::AppHandle,
         }, Some(&app))
     })
     .await
-    .map_err(|e| format!("恢复任务中断：{e}"))?
+    .map_err(|e| format!("恢复任务中断：{e}"))?;
+    match &result {
+        Ok(r) => oplog::record("restore", &repo_log, &tgt_log,
+            &format!("新建 {} 跳过 {} 覆盖 {}", r.created, r.skipped, r.overwritten), "ok", ""),
+        Err(e) => oplog::record("restore", &repo_log, &tgt_log, "", "fail",
+            &e.chars().take(200).collect::<String>()),
+    }
+    result
 }
 
 #[tauri::command]
 fn export_backup(repo: String, target: String) -> Result<export::ExportResult, String> {
-    export::export_repo(&PathBuf::from(repo), &PathBuf::from(target))
+    let result = export::export_repo(&PathBuf::from(&repo), &PathBuf::from(&target));
+    match &result {
+        Ok(r) => oplog::record("export", &repo, &target,
+            &format!("{} 个条目 / {}", r.entries, crate::adopt::format_bytes_pub(r.bytes)), "ok", ""),
+        Err(e) => oplog::record("export", &repo, &target, "", "fail",
+            &e.chars().take(200).collect::<String>()),
+    }
+    result
 }
 
 #[tauri::command]
@@ -135,6 +167,8 @@ async fn deep_scan(deep: bool, cancel: tauri::State<'_, CancellationToken>) -> R
     .unwrap_or_else(|_| ScanResult { homes: Vec::new(), default_repo: default_repo() });
     // 记录扫描结果：deep 记 "deep"，quick 记 "quick"，失败不阻断返回
     let _ = scan_cache::save(&result.homes, if deep { "deep" } else { "quick" });
+    oplog::record("scan", "", if deep { "深度扫描" } else { "快速扫描" },
+        &format!("识别到 {} 个环境", result.homes.len()), "ok", "");
     Ok(result)
 }
 
@@ -150,20 +184,38 @@ fn check_dsh_running() -> Vec<String> {
 
 #[tauri::command]
 async fn adopt_home(app: tauri::AppHandle, repo: String, home_path: String, note: String) -> Result<adopt::AdoptResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let repo_log = repo.clone();
+    let home_log = home_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         adopt::adopt_home_with_progress(&PathBuf::from(repo), &PathBuf::from(home_path), &note, Some(&app))
     })
     .await
-    .map_err(|e| format!("接管任务中断：{e}"))?
+    .map_err(|e| format!("接管任务中断：{e}"))?;
+    match &result {
+        Ok(r) => oplog::record("adopt", &repo_log, &home_log,
+            &format!("移动 {} 个目录，建 {} 个链接", r.moved_dirs.len(), r.created_links.len()), "ok", ""),
+        Err(e) => oplog::record("adopt", &repo_log, &home_log, "", "fail",
+            &e.chars().take(200).collect::<String>()),
+    }
+    result
 }
 
 #[tauri::command]
 async fn unadopt_home(app: tauri::AppHandle, repo: String, home_path: String) -> Result<adopt::UnadoptResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let repo_log = repo.clone();
+    let home_log = home_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         adopt::unadopt_home_with_progress(&PathBuf::from(repo), &PathBuf::from(home_path), Some(&app))
     })
     .await
-    .map_err(|e| format!("断开接管任务中断：{e}"))?
+    .map_err(|e| format!("断开接管任务中断：{e}"))?;
+    match &result {
+        Ok(r) => oplog::record("unadopt", &repo_log, &home_log,
+            &format!("还原 {} 个目录", r.restored_dirs.len()), "ok", ""),
+        Err(e) => oplog::record("unadopt", &repo_log, &home_log, "", "fail",
+            &e.chars().take(200).collect::<String>()),
+    }
+    result
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +298,30 @@ fn clear_scan_cache() {
     scan_cache::clear();
 }
 
+// ===================== 操作日志 =====================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpLogResponse {
+    entries: Vec<oplog::OpEntry>,
+    size_bytes: u64,
+}
+
+#[tauri::command]
+fn list_op_logs() -> OpLogResponse {
+    OpLogResponse { entries: oplog::read_all(), size_bytes: oplog::size_bytes() }
+}
+
+#[tauri::command]
+fn export_op_logs(target: String) -> Result<String, String> {
+    oplog::export_markdown(&PathBuf::from(target))
+}
+
+#[tauri::command]
+fn clear_op_logs() {
+    oplog::clear();
+}
+
 #[tauri::command]
 fn check_link_capability(home_path: String) -> adopt::LinkCapability {
     adopt::check_link_capability(&PathBuf::from(home_path))
@@ -271,7 +347,9 @@ async fn switch_links(
     include_config: bool,
     include_memories: bool,
 ) -> Result<adopt::SwitchResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let repo_log = repo.clone();
+    let route = format!("{} → {}", source_home, target_home);
+    let result = tauri::async_runtime::spawn_blocking(move || {
         adopt::switch_links(
             &PathBuf::from(repo),
             &PathBuf::from(source_home),
@@ -283,7 +361,14 @@ async fn switch_links(
         )
     })
     .await
-    .map_err(|e| format!("切换任务中断：{e}"))?
+    .map_err(|e| format!("切换任务中断：{e}"))?;
+    match &result {
+        Ok(r) => oplog::record("switch", &repo_log, &route,
+            &format!("切换 {} 类内容，保险快照 {}", r.switched_links, r.backup_snapshot), "ok", ""),
+        Err(e) => oplog::record("switch", &repo_log, &route, "", "fail",
+            &e.chars().take(200).collect::<String>()),
+    }
+    result
 }
 #[tauri::command]
 fn list_rollback_ledgers(repo: String) -> Result<Vec<restore::RollbackLedgerEntry>, String> {
@@ -468,7 +553,10 @@ fn main() {
             load_scan_cache,
             clear_scan_cache,
             check_link_capability,
-            cancel_operation
+            cancel_operation,
+            list_op_logs,
+            export_op_logs,
+            clear_op_logs
         ])
         .setup(move |app| {
             let mut builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
