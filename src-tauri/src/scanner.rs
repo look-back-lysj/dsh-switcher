@@ -259,19 +259,21 @@ pub fn scan_session_stats(home: &Path) -> SessionStats {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        let is_v0 = name == "session.jsonl.zstd";
-        let is_v4 = name.starts_with("session.v")
-            && name.ends_with(".jsonl.zstd")
-            && name != "session.jsonl.zstd";
-        if !is_v0 && !is_v4 {
-            continue;
-        }
+        // P-16：按真实代次分档。v3 = session.v3.*，v4 = session.v4.*，更高代也归入 v4 档（向后兼容）。
+        let gen: Option<u32> = if name == "session.jsonl.zstd" {
+            Some(0)
+        } else if let Some(rest) = name.strip_prefix("session.v") {
+            rest.strip_suffix(".jsonl.zstd").and_then(|n| n.parse::<u32>().ok())
+        } else {
+            None
+        };
+        let Some(generation) = gen else { continue };
 
         stats.total += 1;
-        if is_v0 {
-            stats.v0 += 1;
-        } else {
-            stats.v4 += 1;
+        match generation {
+            0 => stats.v0 += 1,
+            3 => stats.v3 += 1,
+            _ => stats.v4 += 1, // 4 及更高代都视作当前代
         }
         let parent = entry.path().parent().map(Path::to_path_buf);
         if let Some(parent) = parent {

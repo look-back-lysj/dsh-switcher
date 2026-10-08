@@ -952,7 +952,7 @@ function renderEnvironment() {
           <code>${escapeHtml(home.path)}</code>
         </div>
         <div class="home-stats">
-          <div>会话 <b>${home.sessions.total}</b>（v0 ${home.sessions.v0} / v4 ${home.sessions.v4}）</div>
+          <div>会话 <b>${home.sessions.total}</b>（v0 ${home.sessions.v0} / v3 ${home.sessions.v3 || 0} / v4 ${home.sessions.v4}）</div>
           <div>备份文件 <b>${home.backupFileCount}</b>，约 <b>${formatBytes(home.backupSize)}</b></div>
         </div>
         <div class="home-badges">

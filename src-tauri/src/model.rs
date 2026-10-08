@@ -70,6 +70,9 @@ pub enum HomeKind {
 #[serde(rename_all = "camelCase")]
 pub struct SessionStats {
     pub v0: u32,
+    /// P-16：v3 单独分档，不再并入 v4（兼容判断要用真实代次）
+    #[serde(default)]
+    pub v3: u32,
     pub v4: u32,
     pub total: u32,
     #[serde(default)]
@@ -88,6 +91,7 @@ impl Default for SessionStats {
     fn default() -> Self {
         Self {
             v0: 0,
+            v3: 0,
             v4: 0,
             total: 0,
             ok: 0,

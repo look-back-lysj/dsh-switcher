@@ -51,10 +51,18 @@ pub fn merge_save(new_homes: &[DiscoveredHome], mode: &str) -> Result<(), String
         for old_home in old.homes {
             if !new_paths.contains(old_home.path.as_str()) {
                 let mut kept = old_home.clone();
-                let note = format!("本次扫描未重新发现（上次由{}扫描发现），可能已移动或删除", old.last_scan_mode);
-                if !kept.warnings.iter().any(|w| w.contains("未重新发现")) {
+                // P-15 修正：先复核路径是否还在，避免"目录完好却报可能已删除"的自相矛盾。
+                let still_exists = std::path::Path::new(&old_home.path).exists();
+                let note = if still_exists {
+                    format!("本次{}扫描未覆盖到（路径仍在，深度扫描可确认）", mode)
+                } else {
+                    format!("上次由{}扫描发现的路径现已不存在，可能已移动或删除", old.last_scan_mode)
+                };
+                let tag = if still_exists { "未覆盖" } else { "已不存在" };
+                if !kept.warnings.iter().any(|w| w.contains("未覆盖") || w.contains("已不存在") || w.contains("未重新发现")) {
                     kept.warnings.push(note);
                 }
+                let _ = tag;
                 merged.push(kept);
             }
         }
@@ -153,13 +161,13 @@ mod tests {
         let loaded = load().expect("merge 后应能读回缓存");
         let deep_only = loaded.homes.iter().find(|h| h.path == deep)
             .expect("浅扫不应删掉深扫发现的条目");
-        assert!(deep_only.warnings.iter().any(|w| w.contains("未重新发现")), "应标注未重新发现");
+        assert!(deep_only.warnings.iter().any(|w| w.contains("已不存在") || w.contains("未覆盖")), "路径不存在应标注已不存在");
         // 再扫到 deep 时标注应被新结果覆盖（新结果无该 warning）
         merge_save(&[fake_home(&shallow), fake_home(&deep)], "quick").unwrap();
         let loaded2 = load().expect("再次 merge 后应能读回缓存");
         let deep_only2 = loaded2.homes.iter().find(|h| h.path == deep)
             .expect("deep 应仍在");
-        assert!(!deep_only2.warnings.iter().any(|w| w.contains("未重新发现")), "重新扫到后不应再标注");
+        assert!(!deep_only2.warnings.iter().any(|w| w.contains("已不存在") || w.contains("未覆盖")), "重新扫到后不应再标注");
     }
 
     #[test]
