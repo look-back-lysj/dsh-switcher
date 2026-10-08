@@ -406,10 +406,17 @@ pub fn preview_restore(repo: &Path, filter: RestoreFilter) -> Result<RestorePrev
     let conflict_count = 0u32;
     let mut warnings = Vec::new();
 
+    let mut credential_skipped = 0u32;
     for file in manifest.files.iter().filter(|f| file_matches_filter(f, &filter)) {
         let rel = restored_rel(file)?;
         let dst = target.join(&rel);
         let exists = dst.exists();
+        // 凭据占位符永远跳过，不进任何计数
+        if file.credential_placeholder {
+            credential_skipped += 1;
+            items.push(RestorePreviewItem { rel, action: "credential-skip".to_string() });
+            continue;
+        }
         let action = if !exists {
             create_count += 1;
             "create"
@@ -436,6 +443,12 @@ pub fn preview_restore(repo: &Path, filter: RestoreFilter) -> Result<RestorePrev
         });
     }
 
+    if credential_skipped > 0 {
+        warnings.push(format!(
+            "有 {} 个凭据文件已被跳过（备份时出于安全已脱敏，恢复不会覆盖你现有的登录与 API Key）。恢复后若发不出消息，请在该版本界面重新录入 API Key。",
+            credential_skipped
+        ));
+    }
     if manifest.homes.iter().any(|h| h.sessions.corrupt > 0) {
         warnings.push("仓库中记录了损坏会话；恢复时同样会跳过这些文件。".into());
     }
@@ -554,6 +567,14 @@ pub fn run_restore(
         if !src.is_file() {
             failed.push(format!("仓库缺少文件：{}", file.path));
             break;
+        }
+
+        // v4.1 安全红线：凭据占位符（备份时脱敏成的空壳）绝不覆盖目标文件。
+        // 同学排查报告 03.3 已证实：空壳覆盖真实凭据会让目标 Key 全丢且更难排查。
+        // 凭据由用户在目标版本界面重录（方案 A），不走文件迁移。
+        if file.credential_placeholder {
+            skipped += 1;
+            continue;
         }
 
         let dst_exists = dst.exists();
@@ -760,12 +781,80 @@ pub fn dsh_running() -> bool {
     }
     false
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repo::{Manifest, ManifestFile, ManifestHome, MTime};
+    use crate::model::{HomeKind, SessionStats};
 
+    fn write_min_repo(repo: &std::path::Path) {
+        std::fs::create_dir_all(repo.join("blobs/root-1")).unwrap();
+        // 凭据空壳 blob（10 字节，模拟 strip 后的骨架）
+        std::fs::write(repo.join("blobs/root-1/.credentials.yaml"), b"# stripped").unwrap();
+        let manifest = Manifest {
+            version: 2,
+            tool: "dsh-vault".into(),
+            created_at: "2026-10-08T00:00:00".into(),
+            host: "test".into(),
+            note: String::new(),
+            homes: vec![ManifestHome {
+                id: "root-1".into(),
+                kind: HomeKind::DshHome,
+                label: "测试".into(),
+                path: "C:\\fake".into(),
+                variant: "unknown".into(),
+                dsh_version: None,
+                sessions: SessionStats::default(),
+            }],
+            files: vec![ManifestFile {
+                root: "root-1".into(),
+                path: "blobs/root-1/.credentials.yaml".into(),
+                size: 10,
+                mtime_ms: MTime::Millis(0),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                status: "ok".into(),
+                kind: "config".into(),
+                rel: ".credentials.yaml".into(),
+                credential_placeholder: true,
+            }],
+            warnings: vec![],
+        };
+        let text = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(repo.join("manifest.json"), text).unwrap();
+    }
 
+    #[test]
+    fn credential_placeholder_is_never_restored_over_existing() {
+        // 跳过条件：dsh_running() 若真检测到 DSH 会提前返回，本测试环境一般无 DSH 进程。
+        if dsh_running() {
+            eprintln!("skip: DSH 正在运行");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("dsh-vault-restore-test-{}", std::process::id()));
+        let repo = base.join("repo");
+        let target = base.join("target");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&target).unwrap();
+        write_min_repo(&repo);
+        // 目标已有真实凭据（478 字节、含 Key 引用，绝不允许被空壳覆盖）
+        let real_cred = target.join(".credentials.yaml");
+        std::fs::write(&real_cred, b"records:\n  - name: DEEPSEEK_API_KEY\n    value: <real>").unwrap();
+        let before = std::fs::read(&real_cred).unwrap();
 
-
-
-
-
-
-
+        let filter = RestoreFilter {
+            scope: crate::repo::RestoreScope::Home,
+            source_home_id: None,
+            target_home: Some(target.to_string_lossy().to_string()),
+            ids: Vec::new(),
+            project: None,
+            mode: crate::repo::RestoreMode::Force, // 即使强制覆盖也不许动凭据
+            since: None,
+        };
+        let result = run_restore(&repo, filter, None).expect("恢复应成功（凭据被跳过）");
+        assert_eq!(result.created, 0, "不应新建任何文件");
+        assert_eq!(result.skipped, 1, "凭据占位符应计入跳过");
+        let after = std::fs::read(&real_cred).unwrap();
+        assert_eq!(before, after, "目标真实凭据绝不允许被空壳覆盖");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

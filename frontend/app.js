@@ -793,14 +793,19 @@ async function tmRestoreSnapshot() {
       showResult($('tm-result'), '当前快照就是最新状态，无需恢复。', false);
       return;
     }
-    // 历史快照恢复：用 restore 命令从仓库恢复
+    // 历史快照恢复：用 restore 命令从仓库恢复。
+    // 后端要的参数名是 sourceHomeId / targetHome / ids（不是 sourceHome / filter），
+    // ids 传空数组表示「恢复全部内容」。
+    const homeId = snap.homes?.[0]?.id || '';
+    const homePath = snap.homes?.[0]?.path || '';
     const result = await invoke('restore', {
       repo: $('backup-repo').value,
       scope: 'home',
       mode: 'fill_missing',
-      sourceHome: snap.homes?.[0]?.path || '',
-      targetHome: snap.homes?.[0]?.path || '',
-      filter: '',
+      sourceHomeId: homeId || null,
+      targetHome: homePath || null,
+      ids: [],
+      project: null,
     });
     showResult($('tm-result'), `恢复完成：新建 ${result.created}，跳过 ${result.skipped}，失败 ${result.failed}。`, false);
     refreshSnapshots();

@@ -90,6 +90,10 @@ pub struct ManifestFile {
     pub kind: String,
     #[serde(default = "default_rel")]
     pub rel: String,
+    /// v4.1 新增：凭据类文件在备份时被脱敏成空壳。
+    /// 恢复/切换端据此跳过，防止空壳覆盖目标真实凭据。
+    #[serde(default)]
+    pub credential_placeholder: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -432,6 +436,7 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
                     status: prev.status,
                     kind: file.kind.clone(),
                     rel,
+                    credential_placeholder: prev.credential_placeholder,
                 });
                 skipped += 1;
                 bytes += prev.size;
@@ -455,6 +460,7 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
                     status: "ok".into(),
                     kind: file.kind.clone(),
                     rel,
+                    credential_placeholder: true,
                 });
                 created += 1;
                 bytes += transformed_size;
@@ -479,6 +485,7 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
                         status: "ok".into(),
                         kind: file.kind.clone(),
                         rel,
+                        credential_placeholder: false,
                     });
                     created += 1;
                     bytes += bytes_data.len() as u64;
@@ -497,6 +504,7 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
                 status: "ok".into(),
                 kind: file.kind.clone(),
                 rel,
+                credential_placeholder: false,
             });
             created += 1;
             bytes += size;
@@ -545,6 +553,7 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
                         status: prev.status,
                         kind: "skill".into(),
                         rel: file.rel,
+                        credential_placeholder: prev.credential_placeholder,
                     });
                     skipped += 1;
                     bytes += prev.size;
@@ -560,6 +569,7 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
                     status: "ok".into(),
                     kind: "skill".into(),
                     rel: file.rel,
+                    credential_placeholder: false,
                 });
                 created += 1;
                 bytes += size;
