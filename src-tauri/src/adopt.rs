@@ -688,6 +688,17 @@ pub fn unadopt_home_with_progress(
     // 清理记录与标记
     let _ = fs::remove_file(adopt_record_path(repo, &home_id));
     let _ = fs::remove_file(repo.join("adopted").join(&home_id).join(ADOPT_MARK));
+    // 断开接管理顺空的 adopted/<id> 目录（files 已还原为空，避免仓库残留空壳）
+    let adopted_dir = repo.join("adopted").join(&home_id);
+    if adopted_dir.is_dir() {
+        let has_files = walkdir::WalkDir::new(&adopted_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|e| e.file_type().is_file());
+        if !has_files {
+            let _ = fs::remove_dir_all(&adopted_dir);
+        }
+    }
 
     // 模块六：断开接管时移除小纸条
     let _ = remove_ai_note(home_path);

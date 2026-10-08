@@ -116,6 +116,7 @@ function renderHealth() {
     const target = parseInt(el.dataset.target, 10);
     if (!isNaN(target)) animateNumber(el, target);
   });
+  // 注：home-list 的卡片渲染统一由 renderEnvironment 负责，这里只处理统计区与空状态。
   if (!state.homes.length) {
     $('health-summary').innerHTML = '';
     $('home-list').innerHTML = `
@@ -126,23 +127,6 @@ function renderHealth() {
     `;
     return;
   }
-
-  $('home-list').innerHTML = state.homes.map((home, idx) => {
-    const [tone, label] = healthBadge(home);
-    return `
-      <article class="home-row stagger-item${missing ? ' is-missing' : ''}" style="--i:${idx + 4}">
-        <div>
-          <strong>${home.label}</strong>
-          <code>${home.path}</code>
-        </div>
-        <div class="home-stats">
-          <div>会话 <b>${home.sessions.total}</b>（v0 ${home.sessions.v0} / v4 ${home.sessions.v4}）</div>
-          <div>备份文件 <b>${home.backupFileCount}</b>，约 <b>${formatBytes(home.backupSize)}</b></div>
-        </div>
-        <div><span class="badge ${tone}">${label}</span></div>
-      </article>
-    `;
-  }).join('');
 }
 
 function fillHomeSelects() {
