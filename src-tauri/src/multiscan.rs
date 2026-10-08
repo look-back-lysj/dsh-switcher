@@ -250,7 +250,7 @@ pub fn multi_scan(quick: bool) -> Vec<DiscoveredHome> {
     let mut homes: Vec<DiscoveredHome> = Vec::new();
     let mut seen_real: HashSet<String> = HashSet::new();
     let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(if quick { 8 } else { 30 });
+        + std::time::Duration::from_secs(if quick { 15 } else { 60 });
 
     let mut candidates: Vec<PathBuf> = Vec::new();
 
@@ -266,7 +266,8 @@ pub fn multi_scan(quick: bool) -> Vec<DiscoveredHome> {
         }
     }
 
-    // 常见根目录
+    // 常见根目录：覆盖官方/民间封装版的真实安装位置。
+    // 除用户目录与 AppData，还要扫 ProgramData（官方版常见）、Public、各固定盘根。
     let home = dirs_home();
     let mut roots = vec![home.clone()];
     if let Some(a) = std::env::var_os("APPDATA") {
@@ -275,23 +276,40 @@ pub fn multi_scan(quick: bool) -> Vec<DiscoveredHome> {
     if let Some(a) = std::env::var_os("LOCALAPPDATA") {
         roots.push(PathBuf::from(a));
     }
-    if !quick {
-        for d in fixed_drives() {
-            if !roots.iter().any(|r| d.starts_with(r) || r.starts_with(&d)) {
-                roots.push(d);
-            }
+    // 官方版与部分封装版装在 ProgramData 下
+    if let Some(a) = std::env::var_os("ProgramData") {
+        roots.push(PathBuf::from(a));
+    }
+    if let Some(a) = std::env::var_os("PUBLIC") {
+        roots.push(PathBuf::from(a));
+    }
+    // 快速扫也覆盖各盘根直下（用户常把 DSH 装在 D:\DSH 之类）
+    for d in fixed_drives() {
+        if !roots.iter().any(|r| d.starts_with(r) || r.starts_with(&d)) {
+            roots.push(d);
         }
     }
+    // 去掉与默认备份仓库同根的扫描，避免扫到自己
+    roots.retain(|r| {
+        let rl = r.to_string_lossy().to_lowercase();
+        !rl.contains("dsh-backups")
+    });
+    // 根目录去重（APPDATA 可能是 ProgramData 子目录等重叠情况）
+    let mut seen_root = HashSet::new();
+    roots.retain(|r| seen_root.insert(r.to_string_lossy().to_lowercase()));
 
-    let max_depth = if quick { 2 } else { 5 };
+    let max_depth = if quick { 3 } else { 5 };
 
     // 遍历候选根
     for root in roots {
         if !root.is_dir() {
             continue;
         }
+        // quick 模式：盘根（如 D:\）只浅扫 depth=1，用户/APPDATA 等用 max_depth。
+        let is_drive_root = root.parent().is_none();
+        let depth_here = if quick && is_drive_root { 1 } else { max_depth };
         for entry in walkdir::WalkDir::new(&root)
-            .max_depth(max_depth)
+            .max_depth(depth_here)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
