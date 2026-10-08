@@ -441,6 +441,20 @@
     </form>
   </dialog>
 
+  <dialog class="confirm-dialog" id="prompt-dialog">
+    <form method="dialog" id="prompt-form">
+      <h3 id="prompt-title">请输入</h3>
+      <p id="prompt-message"></p>
+      <div class="field">
+        <input type="text" id="prompt-input" autocomplete="off" />
+      </div>
+      <div class="confirm-actions">
+        <button class="button" value="" type="submit" id="prompt-cancel">取消</button>
+        <button class="button primary" value="__ok__" type="submit" id="prompt-accept">确定</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="./app.js"></script>
 </body>
 </html>

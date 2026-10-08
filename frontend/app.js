@@ -419,6 +419,38 @@ function confirmDialog({ title, message, items = [], confirmText = '确认执行
   });
 }
 
+// 自定义输入对话框：替代原生 prompt()（WebView2 对原生 prompt 支持差，会导致「点接管没反应/关不掉」）。
+// 返回用户输入的字符串；用户取消返回 null。
+function promptDialog({ title, message = '', defaultValue = '', placeholder = '' }) {
+  const dialog = $('prompt-dialog');
+  $('prompt-title').textContent = title;
+  $('prompt-message').textContent = message;
+  const input = $('prompt-input');
+  input.value = defaultValue;
+  input.placeholder = placeholder;
+  return new Promise((resolve) => {
+    const accept = $('prompt-accept');
+    const onSubmit = (e) => {
+      // 由哪个按钮提交决定结果；取消按钮 value 为空
+      const submitter = e.submitter;
+      const ok = submitter && submitter.value === '__ok__';
+      // 延迟到 dialog 关闭后 resolve，保证状态稳定
+      setTimeout(() => resolve(ok ? input.value : null), 0);
+      cleanup();
+    };
+    const onCancel = () => { resolve(null); cleanup(); };
+    const cleanup = () => {
+      $('prompt-form').removeEventListener('submit', onSubmit);
+      dialog.removeEventListener('cancel', onCancel);
+    };
+    $('prompt-form').addEventListener('submit', onSubmit);
+    dialog.addEventListener('cancel', onCancel); // Esc 键
+    dialog.showModal();
+    input.focus();
+    input.select();
+  });
+}
+
 async function executeRestore() {
   if (!state.preview) return;
   const modeText = {
@@ -924,7 +956,12 @@ async function doAdopt(homePath) {
     });
     return;
   }
-  const note = prompt('给这次接管加个备注（选填），比如"主环境接管"：', home?.label || '');
+  const note = await promptDialog({
+    title: `接管「${home?.label || '这个环境'}」`,
+    message: '给这次接管加个备注（选填），方便以后辨认，比如"主环境接管"。',
+    defaultValue: home?.label || '',
+    placeholder: '备注（可直接确定跳过）',
+  });
   if (note === null) return; // 用户取消
   const accepted = await confirmDialog({
     title: '接管这个环境',

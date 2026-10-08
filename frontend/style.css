@@ -1040,3 +1040,6 @@ input, textarea { caret-color: var(--color-primary); }
 /* 已消失环境（缓存命中但路径不存在）：标灰降透明度，提示用户该环境已卸载/移动 */
 .home-row.is-missing { opacity: 0.55; }
 .home-row.is-missing code { text-decoration: line-through; }
+
+/* prompt-dialog 输入框间距（复用全局 input/field 样式） */
+#prompt-dialog .field { margin-top: 14px; }
