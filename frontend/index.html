@@ -297,6 +297,23 @@
             <span class="rollback-hint">切错了？可以把目标环境恢复到切换前的样子。</span>
             <button class="button compact" id="rollback-switch" type="button">回滚到切换前</button>
           </div>
+
+          <div class="panel migrate-panel" id="migrate-panel" hidden>
+            <div class="migrate-head">
+              <div>
+                <h3 class="migrate-title">只搬几条对话（会话级迁移）</h3>
+                <p class="migrate-sub">勾选要搬的对话（含它们的子对话），目标端已有的对话不会被覆盖。格式转换交给目标版本打开时自动完成。</p>
+              </div>
+              <button class="button compact" id="migrate-load" type="button">读取源环境对话</button>
+            </div>
+            <div class="migrate-toolbar" id="migrate-toolbar" hidden>
+              <label class="migrate-selectall"><input type="checkbox" id="migrate-selectall"> 全选</label>
+              <span class="migrate-count" id="migrate-count"></span>
+              <button class="button compact primary" id="migrate-execute" type="button">迁移选中的对话</button>
+            </div>
+            <div class="migrate-list" id="migrate-list"></div>
+            <div class="result" id="migrate-result" hidden></div>
+          </div>
         </div>
 
         <div class="empty-state" id="switch-empty" hidden>

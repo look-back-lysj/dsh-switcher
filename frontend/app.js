@@ -1296,8 +1296,13 @@ function updateSwitchRoute() {
     $('switch-route-source').textContent = s?.label || '';
     $('switch-route-target').textContent = t?.label || '';
     cfg.hidden = false;
+    // v5：源/目标选定后显示会话级迁移面板
+    const mp = $('migrate-panel');
+    if (mp) mp.hidden = false;
   } else {
     cfg.hidden = true;
+    const mp = $('migrate-panel');
+    if (mp) mp.hidden = true;
   }
   // 卡片选中态
   document.querySelectorAll('.switch-card').forEach(c => {
@@ -1455,6 +1460,110 @@ async function doSyncNew(homePath) {
   }
 }
 
+// v5：会话级迁移（范式升级核心）。源/目标复用切换页的选择。
+let migrateSessionsCache = [];
+
+async function loadMigrateSessions() {
+  const src = state.switchSource;
+  const tgt = state.switchTarget;
+  if (!src || !tgt) {
+    showResult($('migrate-result'), '请先在上面选好「源环境」和「目标环境」。', true);
+    return;
+  }
+  const list = $('migrate-list');
+  list.innerHTML = '<div class="migrate-loading">正在读取源环境的对话…</div>';
+  try {
+    const sessions = await invoke('list_sessions', { home: src });
+    migrateSessionsCache = sessions || [];
+    renderMigrateList();
+  } catch (e) {
+    list.innerHTML = `<div class="migrate-loading">读取失败：${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+function renderMigrateList() {
+  const list = $('migrate-list');
+  const toolbar = $('migrate-toolbar');
+  if (!migrateSessionsCache.length) {
+    list.innerHTML = '<div class="migrate-loading">源环境没有可迁移的对话。</div>';
+    toolbar.hidden = true;
+    return;
+  }
+  toolbar.hidden = false;
+  // 父子血缘：子会话缩进显示，并在 id 后标注
+  const childrenOf = {};
+  migrateSessionsCache.forEach(s => {
+    if (s.parent) (childrenOf[s.parent] = childrenOf[s.parent] || []).push(s.id);
+  });
+  list.innerHTML = migrateSessionsCache.map(s => {
+    const isChild = !!s.parent;
+    const kidCount = (childrenOf[s.id] || []).length;
+    const gen = s.generation > 0 ? `v${s.generation}` : 'v0';
+    const cwdShort = s.cwd ? escapeHtml(s.cwd.split(/[\\/]/).filter(Boolean).pop() || s.cwd) : '未知工作区';
+    const kidBadge = kidCount ? `<span class="migrate-kid" title="含 ${kidCount} 个子对话，会一并迁移">+${kidCount} 子</span>` : '';
+    return `<label class="migrate-row ${isChild ? 'child' : ''}">
+      <input type="checkbox" class="migrate-check" data-id="${escapeHtml(s.id)}">
+      <span class="migrate-row-main">
+        <span class="migrate-row-id">${escapeHtml(s.idHint)}…</span>
+        <span class="migrate-row-cwd">${cwdShort}</span>
+      </span>
+      <span class="migrate-row-meta">${gen}${kidBadge}</span>
+    </label>`;
+  }).join('');
+  updateMigrateCount();
+  // 绑定全选/计数
+  list.querySelectorAll('.migrate-check').forEach(c => c.addEventListener('change', updateMigrateCount));
+}
+
+function updateMigrateCount() {
+  const n = document.querySelectorAll('.migrate-check:checked').length;
+  const total = migrateSessionsCache.length;
+  $('migrate-count').textContent = n ? `已选 ${n} / ${total} 条（子对话自动跟随）` : `共 ${total} 条，勾选要搬的`;
+}
+
+async function doMigrate() {
+  const src = state.switchSource;
+  const tgt = state.switchTarget;
+  const checked = [...document.querySelectorAll('.migrate-check:checked')].map(c => c.dataset.id);
+  if (!checked.length) {
+    showResult($('migrate-result'), '请先勾选至少一条对话。', true);
+    return;
+  }
+  const t = state.homes.find(h => h.path === tgt);
+  const ok = await confirmDialog({
+    title: '迁移对话',
+    message: `将把选中的 ${checked.length} 条对话（含它们的子对话）从源环境迁到「${t?.label}」。`,
+    items: [
+      '目标端已有的同名对话不会被覆盖（id 冲突会自动换新 id）。',
+      '预设会按规则表自动适配成目标端认识的值。',
+      '格式转换交给目标版本打开时自动完成，请迁移后重启目标 DSH。',
+      '请确认所有 DSH 窗口已关闭。',
+    ],
+    confirmText: '开始迁移',
+  });
+  if (!ok) return;
+  try {
+    const result = await withOpProgress(`正在迁移 ${checked.length} 条对话`, () => invoke('migrate_sessions', {
+      repo: state.defaultRepo,
+      sourceHome: src,
+      targetHome: tgt,
+      sessionIds: checked,
+    }));
+    let msg = `迁移完成：${result.migrated} 条对话已搬到「${t?.label}」。`;
+    if (result.remappedIds > 0) msg += `\n\n${result.remappedIds} 条因 id 冲突自动换了新 id（目标原有对话未被覆盖）。`;
+    if (result.notes && result.notes.length) msg += `\n\n${result.notes.join('\n')}`;
+    if (result.errors && result.errors.length) msg += `\n\n注意：${result.errors.join('；')}`;
+    msg += '\n\n请重启目标 DSH 查看这些对话。';
+    showResult($('migrate-result'), msg, false);
+    // 迁移后自体检
+    renderRouteCheck(tgt);
+    const rb = $('routecheck-card'); if (rb) rb.hidden = false;
+    backgroundRescan();
+  } catch (e) {
+    showResult($('migrate-result'), `迁移失败：${e.message || e}`, true);
+  }
+}
+
 // v4.3：一键修复当前环境的非法预设（不用重新切换）。
 async function doFixPresets() {
   const bar = $('preset-fix-bar');
@@ -1602,6 +1711,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (rbBtn) rbBtn.addEventListener('click', doRollbackSwitch);
   const fpBtn = $('fix-presets-btn');
   if (fpBtn) fpBtn.addEventListener('click', doFixPresets);
+  const migLoad = $('migrate-load');
+  if (migLoad) migLoad.addEventListener('click', loadMigrateSessions);
+  const migExec = $('migrate-execute');
+  if (migExec) migExec.addEventListener('click', doMigrate);
+  const migAll = $('migrate-selectall');
+  if (migAll) migAll.addEventListener('change', (e) => {
+    document.querySelectorAll('.migrate-check').forEach(c => { c.checked = e.target.checked; });
+    updateMigrateCount();
+  });
   $('pick-backup-repo').addEventListener('click', async () => {
     const path = await selectDirectory('选择备份仓库');
     if (path) $('backup-repo').value = path;

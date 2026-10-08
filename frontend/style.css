@@ -222,6 +222,55 @@ input[type="text"]:hover, select:hover { border-color: #d1d5db; }
 }
 .result.error { border-color: #fecaca; background: var(--color-danger-bg); color: var(--color-danger); }
 
+/* v5：会话级迁移面板 */
+.migrate-panel { margin-top: 14px; }
+.migrate-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.migrate-title { font-size: 14.5px; color: var(--color-ink); margin: 0 0 4px; }
+.migrate-sub { font-size: 12.5px; color: var(--color-ink-secondary); margin: 0; max-width: 560px; line-height: 1.6; }
+.migrate-toolbar {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 8px 0;
+  border-top: 1px solid var(--color-hairline);
+}
+.migrate-selectall { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--color-ink); cursor: pointer; }
+.migrate-count { font-size: 12.5px; color: var(--color-ink-secondary); flex: 1; }
+.migrate-list {
+  margin-top: 6px;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-control);
+  background: #fbfcfe;
+}
+.migrate-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid #f1f4f9;
+  font-size: 13px;
+}
+.migrate-row:last-child { border-bottom: none; }
+.migrate-row:hover { background: #f4f7fd; }
+.migrate-row.child { padding-left: 32px; background: #fafbfe; }
+.migrate-row-main { flex: 1; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.migrate-row-id { font-family: ui-monospace, Consolas, monospace; color: var(--color-ink); }
+.migrate-row-cwd { color: var(--color-ink-secondary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.migrate-row-meta { color: var(--color-ink-secondary); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.migrate-kid { color: #3f63d8; background: #eef2fd; padding: 0 6px; border-radius: 4px; font-size: 11px; }
+.migrate-loading { padding: 20px; text-align: center; color: var(--color-ink-secondary); font-size: 13px; }
+
 /* v4.3：预设修复条 */
 .preset-fix-bar {
   margin-top: 10px;
