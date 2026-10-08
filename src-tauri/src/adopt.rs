@@ -640,6 +640,14 @@ pub fn adopt_home_with_progress(
 
 /// 断开接管：删除 symlink，把仓库里的目录移回原位置。
 pub fn unadopt_home(repo: &Path, home_path: &Path) -> Result<UnadoptResult, String> {
+    unadopt_home_with_progress(repo, home_path, None)
+}
+
+pub fn unadopt_home_with_progress(
+    repo: &Path,
+    home_path: &Path,
+    app: Option<&tauri::AppHandle>,
+) -> Result<UnadoptResult, String> {
     let running = detect_dsh_processes();
     if !running.is_empty() {
         return Err(format!(
@@ -669,7 +677,11 @@ pub fn unadopt_home(repo: &Path, home_path: &Path) -> Result<UnadoptResult, Stri
             warnings.push(format!("{} 位置已有真实目录，跳过还原以免覆盖", link.rel));
             continue;
         }
-        move_dir(&store_path, &link_path).map_err(|e| format!("还原 {} 失败：{e}", link.rel))?;
+        let total = count_files(&store_path);
+        emit_op_progress(app, 0, total, &format!("正在还原 {}", link.rel));
+        move_dir_with_progress(&store_path, &link_path, app)
+            .map_err(|e| format!("还原 {} 失败：{e}", link.rel))?;
+        emit_op_progress(app, total, total, &format!("{} 已还原", link.rel));
         restored.push(link.rel.clone());
     }
 

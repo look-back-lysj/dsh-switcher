@@ -150,9 +150,9 @@ async fn adopt_home(app: tauri::AppHandle, repo: String, home_path: String, note
 }
 
 #[tauri::command]
-async fn unadopt_home(repo: String, home_path: String) -> Result<adopt::UnadoptResult, String> {
+async fn unadopt_home(app: tauri::AppHandle, repo: String, home_path: String) -> Result<adopt::UnadoptResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        adopt::unadopt_home(&PathBuf::from(repo), &PathBuf::from(home_path))
+        adopt::unadopt_home_with_progress(&PathBuf::from(repo), &PathBuf::from(home_path), Some(&app))
     })
     .await
     .map_err(|e| format!("断开接管任务中断：{e}"))?
