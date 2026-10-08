@@ -11,6 +11,145 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// ===================== Junction（免管理员目录链接）=====================
+// 依据：Rust std::sys::fs::windows::junction_point（nightly 模板）+ Microsoft Learn：
+// - junction 是 IO_REPARSE_TAG_MOUNT_POINT reparse point，经 FSCTL_SET_REPARSE_POINT 写入，
+//   全程不需要 SeCreateSymbolicLinkPrivilege，故普通用户免管理员即可创建；
+// - junction 仅支持本机目录、目标必须真实存在、目标总是绝对路径（不支持相对/网络路径）。
+// 对照：symlink（IO_REPARSE_TAG_SYMLINK）即使加 ALLOW_UNPRIVILEGED_CREATE 也要求先开开发者模式。
+#[cfg(windows)]
+mod junction {
+    use std::ffi::OsStr;
+    use std::mem::{offset_of, MaybeUninit};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MAXIMUM_REPARSE_DATA_BUFFER_SIZE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+
+    fn to_wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// 把任意路径转成 NT 风格 \??\C:\... 绝对路径（junction 要求）。
+    fn nt_absolute(original: &Path) -> Result<Vec<u16>, String> {
+        let abs: PathBuf = if original.is_absolute() {
+            original.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(|e| e.to_string())?.join(original)
+        };
+        let s = abs.to_string_lossy().replace('/', "\\");
+        let nt = if let Some(rest) = s.strip_prefix("\\?\\") {
+            format!("\\??\\{}", rest)
+        } else if let Some(rest) = s.strip_prefix("\\.\\") {
+            format!("\\??\\{}", rest)
+        } else if let Some(rest) = s.strip_prefix("\\") {
+            format!("\\??\\UNC\\{}", rest)
+        } else if s.len() >= 2 && s.as_bytes()[1] == b':' {
+            format!("\\??\\{}", s)
+        } else {
+            return Err(format!("无法转成 NT 绝对路径：{s}"));
+        };
+        Ok(nt.encode_utf16().collect())
+    }
+
+    #[repr(C)]
+    struct MountPointBuffer {
+        reparse_tag: u32,
+        reparse_data_length: u16,
+        reserved: u16,
+        substitute_name_offset: u16,
+        substitute_name_length: u16,
+        print_name_offset: u16,
+        print_name_length: u16,
+        path_buffer: [MaybeUninit<u16>; (MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize) / 2],
+    }
+
+    /// 创建 junction（免管理员）。link 必须不存在；target 必须已存在且为本机目录。
+    pub fn create(link: &Path, target: &Path) -> Result<(), String> {
+        if !target.is_dir() {
+            return Err(format!("目标不是目录：{}", target.display()));
+        }
+        if link.symlink_metadata().is_ok() {
+            return Err(format!("链接位置已存在：{}", link.display()));
+        }
+        std::fs::create_dir(link).map_err(|e| format!("创建空目录失败：{e}"))?;
+
+        let wide = to_wide(link.as_os_str());
+        let handle: HANDLE = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let err = std::io::Error::last_os_error();
+            let _ = std::fs::remove_dir(link);
+            return Err(format!("打开目录失败：{err}"));
+        }
+        let owned = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+        let raw = owned.as_raw_handle() as HANDLE;
+
+        let abs = nt_absolute(target)?;
+        let mut buf = MountPointBuffer {
+            reparse_tag: IO_REPARSE_TAG_MOUNT_POINT,
+            reparse_data_length: 0,
+            reserved: 0,
+            substitute_name_offset: 0,
+            substitute_name_length: (abs.len() * 2) as u16,
+            print_name_offset: ((abs.len() + 1) * 2) as u16,
+            print_name_length: 0,
+            path_buffer: [MaybeUninit::uninit(); (MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize) / 2],
+        };
+        let need = abs.len() + 2;
+        if need > buf.path_buffer.len() {
+            drop(owned);
+            let _ = std::fs::remove_dir(link);
+            return Err("目标路径过长".to_string());
+        }
+        for (i, w) in abs.iter().enumerate() {
+            buf.path_buffer[i].write(*w);
+        }
+        buf.path_buffer[abs.len()].write(0);
+        buf.path_buffer[abs.len() + 1].write(0);
+        let total_len = offset_of!(MountPointBuffer, path_buffer) + (abs.len() + 2) * 2;
+        buf.reparse_data_length = (total_len - offset_of!(MountPointBuffer, substitute_name_offset)) as u16;
+
+        let mut ret = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                raw,
+                FSCTL_SET_REPARSE_POINT,
+                (&buf as *const MountPointBuffer).cast(),
+                total_len as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut ret,
+                std::ptr::null_mut(),
+            )
+        };
+        drop(owned); // CloseHandle
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = std::fs::remove_dir(link);
+            return Err(format!("写 reparse point 失败：{err}"));
+        }
+        Ok(())
+    }
+}
+
+
 /// 接管的子目录（只接管这些小而重要的目录）。
 pub const ADOPT_DIRS: &[&str] = &[
     "sessions",
@@ -175,34 +314,47 @@ fn relative_path(from_dir: &Path, target: &Path) -> Option<PathBuf> {
     Some(rel)
 }
 
-/// 创建目录级 symlink，优先相对路径（同盘符），失败报错提示开开发者模式。
+/// 创建目录级链接：Windows 上优先 junction（免管理员），失败再退回 symlink（需开发者模式/管理员）。
+/// 返回记录的 target 字符串：junction 用绝对路径，symlink 保持原有相对/绝对逻辑。
 pub fn create_dir_link(link: &Path, target: &Path) -> Result<String, String> {
     if link.exists() || link.symlink_metadata().is_ok() {
         return Err(format!("链接位置已存在：{}", link.display()));
     }
-    let (final_target, _absolute) = if same_volume(link, target) {
-        let parent = link.parent().ok_or_else(|| "无法获取链接父目录".to_string())?;
-        match relative_path(parent, target) {
-            Some(rel) => (rel, false),
-            None => (target.to_path_buf(), true),
-        }
-    } else {
-        (target.to_path_buf(), true)
-    };
 
     #[cfg(windows)]
     {
+        // 1) 优先 junction：免管理员、跨盘支持、兼容性更高。
+        match junction::create(link, target) {
+            Ok(()) => {
+                return Ok(target.to_string_lossy().to_string());
+            }
+            Err(_jerr) => {
+                // junction 失败（罕见：非 NTFS / 目标不存在等），落回 symlink。
+            }
+        }
+        // 2) symlink 兜底：保留相对路径便携性。
+        let (final_target, _absolute) = if same_volume(link, target) {
+            let parent = link.parent().ok_or_else(|| "无法获取链接父目录".to_string())?;
+            match relative_path(parent, target) {
+                Some(rel) => (rel, false),
+                None => (target.to_path_buf(), true),
+            }
+        } else {
+            (target.to_path_buf(), true)
+        };
         std::os::windows::fs::symlink_dir(&final_target, link).map_err(|e| {
             format!(
-                "创建链接失败：{e}。请以开发者模式运行 Windows（设置→系统→开发者选项→开发者模式），或以管理员身份运行本工具。"
+                "创建链接失败：{e}。已优先尝试 junction（免管理员）失败；请开启开发者模式（设置→系统→开发者选项→开发者模式）或以管理员身份运行本工具后重试。"
             )
         })?;
+        return Ok(final_target.to_string_lossy().to_string());
     }
     #[cfg(not(windows))]
     {
+        let final_target = target.to_path_buf();
         std::os::unix::fs::symlink(&final_target, link).map_err(|e| format!("创建链接失败：{e}"))?;
+        Ok(final_target.to_string_lossy().to_string())
     }
-    Ok(final_target.to_string_lossy().to_string())
 }
 
 /// 通过 Tauri 发送 op-progress 事件（无 app 时静默）。
@@ -1009,6 +1161,45 @@ mod tests {
     fn same_volume_check() {
         assert!(same_volume(Path::new(r"C:\a"), Path::new(r"C:\b")));
         assert!(!same_volume(Path::new(r"C:\a"), Path::new(r"D:\b")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_create_and_readthrough() {
+        // junction 在普通权限下即可创建，且能读穿到 target。
+        let base = std::env::temp_dir().join(format!("dsh-junction-test-{}", std::process::id()));
+        let target = base.join("target");
+        let link = base.join("link");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("probe.txt"), b"junction-ok").unwrap();
+
+        junction::create(&link, &target).expect("junction 创建应成功（免管理员）");
+
+        // 被识别为 reparse point / symlink 语义
+        let meta = link.symlink_metadata().unwrap();
+        assert!(meta.file_type().is_symlink(), "junction 应被 symlink_metadata 识别");
+        // 读穿
+        let got = fs::read(link.join("probe.txt")).unwrap();
+        assert_eq!(got, b"junction-ok");
+        // 删除 junction 不影响 target
+        fs::remove_dir(&link).unwrap();
+        assert!(target.join("probe.txt").is_file(), "删除 junction 后 target 应完好");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_target_is_absolute_nt_path() {
+        // junction 的 target 必须解析为 NT 绝对路径；相对 target 也能正确处理。
+        let base = std::env::temp_dir().join(format!("dsh-junction-rel-{}", std::process::id()));
+        let target = base.join("real");
+        fs::create_dir_all(&target).unwrap();
+        let link = base.join("lnk");
+        junction::create(&link, &target).expect("junction 应成功");
+        assert!(link.is_dir(), "通过 junction 应能看到目录");
+        fs::remove_dir(&link).unwrap();
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
