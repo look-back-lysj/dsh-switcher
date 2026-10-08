@@ -1385,6 +1385,9 @@ async function doSwitch() {
     if (result.settingsCopied) {
       msg += `\n\n模型提供方配置已一并带过去（settings.yaml）。请重启「${t?.label}」，它启动时会自动导入这份配置。`;
     }
+    if (result.presetFixed > 0) {
+      msg += `\n\n已自动修复 ${result.presetFixed} 条对话的预设（anchored-standard 等改成官方认识的 standard），这些对话现在能正常继续了。`;
+    }
     if (result.credentialNote) {
       msg += `\n\n提醒：API Key 没有随切换迁移（密钥环保护，安全设计）。如果「${t?.label}」发不出消息，打开它的设置 → 凭据，重新录入一次 API Key 即可。`;
     }
@@ -1452,6 +1455,22 @@ async function doSyncNew(homePath) {
   }
 }
 
+// v4.3：一键修复当前环境的非法预设（不用重新切换）。
+async function doFixPresets() {
+  const bar = $('preset-fix-bar');
+  if (!bar || !bar.dataset.target) return;
+  try {
+    const report = await withOpProgress('正在修复对话预设', () =>
+      invoke('fix_presets_now', { targetHome: bar.dataset.target }));
+    bar.hidden = true;
+    const note = (report.notes && report.notes.join(' ')) || `已修复 ${report.rewritten} 条对话的预设。`;
+    showResult($('switch-result'), note + ' 现在可以正常继续这些对话了。', false);
+    renderRouteCheck(bar.dataset.target); // 重新体检
+  } catch (e) {
+    showResult($('switch-result'), `修复失败：${e.message || e}`, true);
+  }
+}
+
 // v4.2 模块F：一键回滚到切换前。
 async function doRollbackSwitch() {
   const bar = $('rollback-bar');
@@ -1509,6 +1528,12 @@ async function renderRouteCheck(targetHome) {
       li.textContent = line;
       todo.appendChild(li);
     });
+    // v4.3：若发现对话用了非常见预设，显示「一键修复」条
+    const knownPresets = ['standard', 'code', 'ptc', 'ask', 'architect'];
+    const hasBadPreset = (report.verdicts || []).some(v => v.preset && !knownPresets.includes(v.preset));
+    const pfb = $('preset-fix-bar');
+    if (pfb) { pfb.hidden = !hasBadPreset; pfb.dataset.target = targetHome; }
+
     const list = $('routecheck-list');
     list.innerHTML = '';
     const label = { ok: '可直接继续', need_model: '需换模型', need_credential: '需补 Key', archived: '已归档', cwd_missing: '工作目录缺失', attachment_missing: '附件缺失' };
@@ -1575,6 +1600,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('rescan').addEventListener('click', scan);
   const rbBtn = $('rollback-switch');
   if (rbBtn) rbBtn.addEventListener('click', doRollbackSwitch);
+  const fpBtn = $('fix-presets-btn');
+  if (fpBtn) fpBtn.addEventListener('click', doFixPresets);
   $('pick-backup-repo').addEventListener('click', async () => {
     const path = await selectDirectory('选择备份仓库');
     if (path) $('backup-repo').value = path;

@@ -23,6 +23,9 @@ pub struct SessionVerdict {
     pub cwd: Option<String>,
     /// 最后一条 model/selection 的 provider/model，如 "qiu005/deepseek-v4.1-flash"
     pub route: Option<String>,
+    /// v4.3：会话 header 里的 agentPreset（供前端检测非法预设）
+    #[serde(default)]
+    pub preset: Option<String>,
     /// ok / need_model / need_credential / archived / cwd_missing / attachment_missing
     pub status: String,
     pub notes: Vec<String>,
@@ -189,17 +192,19 @@ fn frame_start(f: &crate::zstd_check::FrameRange) -> usize { f.start() }
 fn frame_end(f: &crate::zstd_check::FrameRange) -> usize { f.end() }
 
 /// 从会话行里提取：header 的 id/cwd + 最后一条 model/selection + 附件引用数
-fn analyze_session_lines(lines: &[String]) -> (Option<String>, Option<String>, Option<String>, u32) {
+fn analyze_session_lines(lines: &[String]) -> (Option<String>, Option<String>, Option<String>, u32, Option<String>) {
     let mut id = None;
     let mut cwd = None;
     let mut last_route: Option<String> = None;
     let mut attachments = 0u32;
+    let mut preset = None;
     for (idx, line) in lines.iter().enumerate() {
         if idx == 0 {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("type").and_then(|t| t.as_str()) == Some("session") {
                     id = v.get("id").and_then(|x| x.as_str()).map(String::from);
                     cwd = v.get("cwd").and_then(|x| x.as_str()).map(String::from);
+                    preset = v.get("agentPreset").and_then(|x| x.as_str()).map(String::from);
                 }
             }
         }
@@ -231,7 +236,7 @@ fn analyze_session_lines(lines: &[String]) -> (Option<String>, Option<String>, O
             attachments += 1;
         }
     }
-    (id, cwd, last_route, attachments)
+    (id, cwd, last_route, attachments, preset)
 }
 
 /// 归档名单：storages/workspace.json 的 global.archivedSessionIds
@@ -267,15 +272,17 @@ pub fn check_routability(target_home: &Path) -> RouteCheckReport {
                     title_hint: dir_name.trim_start_matches("session-").chars().take(8).collect(),
                     cwd: None,
                     route: None,
+                    preset: None,
                     status: "ok".into(),
                     notes: Vec::new(),
                 };
                 match decompress_session(&file) {
                     Ok(lines) => {
-                        let (id, cwd, route, att) = analyze_session_lines(&lines);
+                        let (id, cwd, route, att, preset) = analyze_session_lines(&lines);
                         if let Some(i) = id { v.id = i.clone(); v.title_hint = i.chars().take(8).collect(); }
                         v.cwd = cwd;
                         v.route = route;
+                        v.preset = preset;
                         // 1. 归档
                         if archived.contains(&v.id) || archived.iter().any(|a| v.id.starts_with(a.as_str())) {
                             v.status = "archived".into();
@@ -402,7 +409,7 @@ mod tests {
             r#"{"type":"attachment","attachmentId":"a1"}"#.to_string(),
             r#"{"type":"request/header","data":{"header":{"config":{"provider":"gpt020qiu","model":"gpt-6-astra"}}}}"#.to_string(),
         ];
-        let (id, cwd, route, att) = analyze_session_lines(&lines);
+        let (id, cwd, route, att, _preset) = analyze_session_lines(&lines);
         assert_eq!(id.as_deref(), Some("abc123"));
         assert_eq!(cwd.as_deref(), Some("E:\\VS"));
         assert_eq!(route.as_deref(), Some("gpt020qiu/gpt-6-astra"));

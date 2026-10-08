@@ -6,6 +6,7 @@ mod model;
 mod oplog;
 mod multiscan;
 mod repo;
+mod preset_fix;
 mod routecheck;
 mod scan_cache;
 mod scanner;
@@ -415,6 +416,15 @@ fn switch_preflight(repo: String, source_home: String, target_home: String) -> R
 }
 
 #[tauri::command]
+async fn fix_presets_now(target_home: String) -> Result<preset_fix::PresetFixReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        preset_fix::fix_unknown_presets(&PathBuf::from(target_home))
+    })
+    .await
+    .map_err(|e| format!("修复任务中断：{e}"))
+}
+
+#[tauri::command]
 fn check_routability(target_home: String) -> Result<routecheck::RouteCheckReport, String> {
     Ok(routecheck::check_routability(&PathBuf::from(target_home)))
 }
@@ -585,6 +595,7 @@ fn main() {
             undo_last,
             list_rollback_ledgers,
             check_routability,
+            fix_presets_now,
             switch_preflight,
             watch_check,
             watch_mark_synced,

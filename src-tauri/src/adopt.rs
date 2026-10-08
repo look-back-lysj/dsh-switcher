@@ -813,6 +813,9 @@ pub struct SwitchResult {
     /// 这是"能看不能聊"的根治：模型提供方配置随切换走（API Key 仍不带）。
     #[serde(default)]
     pub settings_copied: bool,
+    /// v4.3：本次改写了多少条对话的非法预设（anchored-standard → standard）。
+    #[serde(default)]
+    pub preset_fixed: u32,
 }
 
 /// v4.2 模块F：一键回滚到"切换前"。
@@ -1254,6 +1257,20 @@ pub fn switch_links(
         }
     }
 
+    // v4.3 预设兼容改写：切了对话记录后，把目标端不认识的 agentPreset 改写成官方内置 standard。
+    // 根治"Unknown agent preset: anchored-standard"——用户截图实证这是 resume 失败的直接原因。
+    let mut preset_fixed_count = 0u32;
+    if include_sessions {
+        let report = crate::preset_fix::fix_unknown_presets(target_home);
+        preset_fixed_count = report.rewritten;
+        if report.rewritten > 0 {
+            details.push(report.notes.join(" "));
+        }
+        if report.failed > 0 {
+            warnings.push(format!("{} 条对话读取异常未做预设兼容（不影响其它对话）。", report.failed));
+        }
+    }
+
     Ok(SwitchResult {
         switched_links: switched,
         backup_snapshot: snap_name,
@@ -1261,6 +1278,7 @@ pub fn switch_links(
         warnings,
         credential_note,
         settings_copied,
+        preset_fixed: preset_fixed_count,
     })
 }
 
@@ -2128,6 +2146,46 @@ mod tests {
         assert_eq!(fs::read(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd")).unwrap(), b"B-data");
         // A 的内容不在了（被回滚覆盖）
         assert!(!home_b.join("sessions").join("pA").exists(), "回滚后不应再有 A 的会话");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn e2e_switch_fixes_unknown_preset() {
+        // v4.3：源端会话带 anchored-standard，切换后目标端应被改写成 standard
+        let base = std::env::temp_dir().join(format!("dsh-vault-pfe2e-{}", std::process::id()));
+        let repo = base.join("repo");
+        let home_a = base.join("homeA");
+        let sess_dir = home_a.join("sessions").join("pA").join("s1");
+        fs::create_dir_all(&sess_dir).unwrap();
+        // 构造一条带 anchored-standard 的真实 zstd 会话
+        let header = "{\"type\":\"session\",\"version\":0,\"id\":\"s1\",\"createdAt\":1,\"cwd\":\"E:\\\\x\",\"agentPreset\":\"anchored-standard\"}\n";
+        let body = "{\"type\":\"user/message\",\"seq\":1}\n";
+        let mut bytes = zstd::encode_all(std::io::Cursor::new(header.as_bytes()), 3).unwrap();
+        bytes.extend_from_slice(&zstd::encode_all(std::io::Cursor::new(body.as_bytes()), 3).unwrap());
+        fs::write(sess_dir.join("session.jsonl.zstd"), &bytes).unwrap();
+        fs::write(home_a.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        let home_b = base.join("homeB");
+        fs::create_dir_all(home_b.join("sessions").join("pB").join("s2")).unwrap();
+        fs::write(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd"), b"B").unwrap();
+        fs::write(home_b.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        adopt_home(&repo, &home_a, "A").unwrap();
+        adopt_home(&repo, &home_b, "B").unwrap();
+
+        let result = switch_links(&repo, &home_a, &home_b, true, false, false, false, false).unwrap();
+        assert_eq!(result.preset_fixed, 1, "应改写 1 条非法预设");
+
+        // 目标端会话 header 现在是 standard
+        let written = fs::read(home_b.join("sessions").join("pA").join("s1").join("session.jsonl.zstd")).unwrap();
+        let (frames, _) = crate::zstd_check::scan_frames(&written).unwrap();
+        let header_dec = zstd::decode_all(std::io::Cursor::new(&written[frames[0].start()..frames[0].end()])).unwrap();
+        let text = String::from_utf8_lossy(&header_dec);
+        assert!(text.contains("\"agentPreset\":\"standard\""), "应改写成 standard: {}", &text[..120.min(text.len())]);
+        assert!(!text.contains("anchored-standard"));
+        // 对话内容帧原样保留
+        let body_dec = zstd::decode_all(std::io::Cursor::new(&written[frames[1].start()..frames[1].end()])).unwrap();
+        assert!(String::from_utf8_lossy(&body_dec).contains("user/message"));
 
         let _ = fs::remove_dir_all(&base);
     }

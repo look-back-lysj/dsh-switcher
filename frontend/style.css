@@ -222,6 +222,20 @@ input[type="text"]:hover, select:hover { border-color: #d1d5db; }
 }
 .result.error { border-color: #fecaca; background: var(--color-danger-bg); color: var(--color-danger); }
 
+/* v4.3：预设修复条 */
+.preset-fix-bar {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid #f3d9a4;
+  border-radius: var(--radius-control);
+  background: #fffdf7;
+}
+.preset-fix-hint { font-size: 12px; color: var(--color-ink-secondary); }
+
 /* v4.2 模块E：接管兼容性自查卡片 */
 .compat-card {
   margin-top: 14px;
