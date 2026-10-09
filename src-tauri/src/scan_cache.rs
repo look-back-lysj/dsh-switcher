@@ -30,6 +30,11 @@ pub struct ScanCache {
 
 /// 缓存文件位置：%APPDATA%/com.dsh.vault/scan-cache.json
 fn cache_path() -> PathBuf {
+    // 测试隔离：单元测试用进程专属临时目录，绝不写真实 %APPDATA% 缓存（防污染用户界面）。
+    // 之前测试直接写真缓存，导致 C:\m5-* 测试环境残留出现在用户扫描结果里。
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("dsh-vault-scan-cache-test-{}", std::process::id()));
+    }
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
