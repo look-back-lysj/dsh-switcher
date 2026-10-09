@@ -380,7 +380,13 @@ async fn switch_links(
     .map_err(|e| format!("切换任务中断：{e}"))?;
     match &result {
         Ok(r) => oplog::record("switch", &repo_log, &route,
-            &format!("切换 {} 类内容，保险快照 {}", r.switched_links, r.backup_snapshot), "ok", ""),
+            &format!(
+                "切换 {} 类内容（{}），保险快照 {}；补登记对话 {} 条",
+                r.switched_links,
+                if r.replace_mode { "替换模式" } else { "合并模式（目标端已有内容已保留）" },
+                r.backup_snapshot,
+                r.registry_repaired
+            ), "ok", ""),
         Err(e) => oplog::record("switch", &repo_log, &route, "", "fail",
             &e.chars().take(200).collect::<String>()),
     }
