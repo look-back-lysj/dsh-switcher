@@ -37,9 +37,13 @@ fn scan_homes() -> ScanResult {
     }
     // 记录扫描结果（quick），失败不阻断返回；增量合并防浅扫覆盖深扫
     let _ = scan_cache::merge_save(&homes, "quick");
-    oplog::record("scan", "", "快速扫描", &format!("识别到 {} 个环境", homes.len()), "ok", "");
+    // v5.2 问题①根治：rescan 不能把深扫发现的环境从界面上顶掉。
+    // merge_save 合并了缓存，但前端显示用的是当次返回值（只有浅层能发现的）。
+    // 所以这里返回「合并后的完整缓存」（含深扫历史发现），而不是只返回当次浅扫结果。
+    let display_homes = scan_cache::load().map(|c| c.homes).unwrap_or(homes);
+    oplog::record("scan", "", "快速扫描", &format!("识别到 {} 个环境", display_homes.len()), "ok", "");
     ScanResult {
-        homes,
+        homes: display_homes,
         default_repo: default_repo(),
     }
 }
