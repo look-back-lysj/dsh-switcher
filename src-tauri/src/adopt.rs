@@ -855,6 +855,12 @@ pub struct SwitchResult {
     /// v7：本次补登记的对话条数
     #[serde(default)]
     pub registry_repaired: usize,
+    /// v8：切换后仍因「原工作目录不存在」而不会被官方显示的对话条数
+    #[serde(default)]
+    pub sessions_missing_dir: usize,
+    /// v8：切换后处于归档名单、默认隐藏的对话条数
+    #[serde(default)]
+    pub sessions_archived: usize,
 }
 
 /// v5 模块三：为保险快照生成 manifest（rel → sha256 + size），回滚校验用。
@@ -1161,28 +1167,32 @@ pub fn switch_preflight(repo: &Path, source_home: &Path, target_home: &Path) -> 
         notices.push("源环境的对话目录 10 秒内有写入，源 DSH 可能还开着。建议先关闭源端再切，避免切到写了一半的对话。".to_string());
     }
 
-    // 2. 目标端独有会话数（镜像语义预告）
-    let count_sessions = |root: &Path| -> usize {
+    // 2. 目标端独有会话（集合差，而不是数量差——两边条数相同但内容不同时数量差会漏报）
+    let collect_ids = |root: &Path| -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
         let sessions = root.join("sessions");
-        if !sessions.is_dir() { return 0; }
-        let mut n = 0;
+        if !sessions.is_dir() { return ids; }
         for proj in fs::read_dir(&sessions).into_iter().flatten().flatten() {
             if let Ok(entries) = fs::read_dir(proj.path()) {
-                n += entries.flatten().filter(|e| e.path().is_dir()).count();
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        ids.insert(entry.file_name().to_string_lossy().to_string());
+                    }
+                }
             }
         }
-        n
+        ids
     };
     let src_id = home_id_of(source_home);
     let tgt_id = home_id_of(target_home);
     let src_store = repo_files_dir(repo, &src_id);
     let tgt_store = repo_files_dir(repo, &tgt_id);
-    let src_n = count_sessions(&src_store);
-    let tgt_n = count_sessions(&tgt_store);
-    let target_only = tgt_n.saturating_sub(src_n);
+    let src_ids = collect_ids(&src_store);
+    let tgt_ids = collect_ids(&tgt_store);
+    let target_only = tgt_ids.difference(&src_ids).count();
     if target_only > 0 {
         notices.push(format!(
-            "目标环境比源环境多约 {target_only} 条对话。切换是【替换】：这些目标端独有的对话会先存进保险快照（可回滚），不会丢。"
+            "目标环境有 {target_only} 条来源环境没有的独有对话：替换模式下会先存进保险快照（可回滚），合并模式下保持不动。"
         ));
     }
 
@@ -1272,6 +1282,18 @@ pub fn switch_links(
         fs::copy(&tgt_settings, &dst).map_err(|e| format!("备份目标端 settings.yaml 失败：{e}"))?;
     }
 
+    // v8 修复一：合并模式下 copy_dir_merge 会用来源的同名文件覆盖目标，
+    // 其中 storages/workspace.json 一旦被覆盖，「目标端登记全部保留」就形同虚设。
+    // 复制前先留一份目标原件，复制后写回再与来源合并。
+    // v8 修复二：对话的「可见性」由 workspace.json 决定——只勾「对话记录」时
+    // 也必须同步这张登记表，否则文件搬过去了、侧栏依然看不到。
+    let sync_workspace_index = include_sessions || dirs.contains(&"storages");
+    let tgt_ws_saved: Option<Vec<u8>> = if !replace_mode && sync_workspace_index {
+        fs::read(tgt_files.join("storages").join("workspace.json")).ok()
+    } else {
+        None
+    };
+
     // 4. 复制式切换：把来源内容复制进目标自己的存档（链接不动，仍指向自己）
     let mut switched = 0u32;
     for dir in &dirs {
@@ -1304,9 +1326,19 @@ pub fn switch_links(
     }
 
     // v7 合并模式：workspace.json 结构化合并（目标端已有的工作区与对话登记全部保留）
-    if !replace_mode && dirs.contains(&"storages") {
+    // v8：先补回上面被 copy_dir_merge 覆盖掉的目标原件，再做合并，否则合并的是「来源自己」；
+    //      且只要涉及对话就执行（不再要求同时勾了「配置」）。
+    if !replace_mode && sync_workspace_index {
         let src_ws = src_files.join("storages").join("workspace.json");
         let tgt_ws = tgt_files.join("storages").join("workspace.json");
+        if let Some(bytes) = &tgt_ws_saved {
+            if let Some(parent) = tgt_ws.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Err(e) = fs::write(&tgt_ws, bytes) {
+                warnings.push(format!("合并前恢复目标端 workspace.json 原件失败：{e}"));
+            }
+        }
         if src_ws.is_file() {
             match crate::migrate::merge_workspace_json(&tgt_ws, &src_ws) {
                 Ok((ws_added, sess_added)) => details.push(format!(
@@ -1319,11 +1351,20 @@ pub fn switch_links(
 
     // v7 对话登记修复：把磁盘上但没登记的对话补登记（只增不删，两种模式都跑）
     let mut registry_repaired = 0usize;
+    let mut sessions_missing_dir = 0usize;
+    let mut sessions_archived = 0usize;
     if include_sessions {
         if let Ok(rep) = crate::migrate::repair_session_registry(target_home) {
             registry_repaired = rep.registered;
+            sessions_missing_dir = rep.missing_dir;
+            sessions_archived = rep.archived;
             if rep.registered > 0 {
                 details.push(format!("对话登记修复：补登记 {} 条磁盘上有但侧栏没登记的对话", rep.registered));
+            }
+            for note in &rep.notes {
+                if note.contains("不存在") || note.contains("没有记录工作目录") || note.contains("归档") {
+                    warnings.push(note.clone());
+                }
             }
         }
     }
@@ -1448,6 +1489,8 @@ pub fn switch_links(
         keys_to_enter,
         replace_mode,
         registry_repaired,
+        sessions_missing_dir,
+        sessions_archived,
     })
 }
 
@@ -2241,7 +2284,8 @@ mod tests {
 
         let pf = switch_preflight(&repo, &home_a, &home_b);
         assert!(pf.source_has_settings, "源端有 settings.yaml");
-        assert_eq!(pf.target_only_sessions, 1, "目标多 1 条会话");
+        // v8：独有会话按 id 集合差算——B 的 s2、s3 都不在 A 里，共 2 条（旧的数量差只算 1，会漏报）
+        assert_eq!(pf.target_only_sessions, 2, "目标应有 2 条独有会话");
         assert!(pf.notices.iter().any(|n| n.contains("settings.yaml")), "应提示带配置");
         assert!(pf.notices.iter().any(|n| n.contains("替换")), "应提示镜像语义");
 
@@ -2407,6 +2451,15 @@ mod tests {
         fs::create_dir_all(home_b.join("sessions").join("pB").join("s2")).unwrap();
         fs::write(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd"), b"B-only-data").unwrap();
         fs::write(home_b.join("settings.yaml"), b"agent-presets: {}").unwrap();
+        // v8：两边各有一份 workspace.json 登记表，验证「登记真合并」
+        let storages_a = home_a.join("storages");
+        fs::create_dir_all(&storages_a).unwrap();
+        fs::write(storages_a.join("workspace.json"),
+            r#"{"unit":{"name":"workspace","version":2},"global":{"initialized":true,"workspaceIds":["ws-a"],"archivedSessionIds":[]},"tables":{"workspaces":{"ws-a":{"path":"A:\\proj","title":"A","sessionIds":["s1"],"createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"}}}}"#).unwrap();
+        let storages_b = home_b.join("storages");
+        fs::create_dir_all(&storages_b).unwrap();
+        fs::write(storages_b.join("workspace.json"),
+            r#"{"unit":{"name":"workspace","version":2},"global":{"initialized":true,"workspaceIds":["ws-b"],"archivedSessionIds":[]},"tables":{"workspaces":{"ws-b":{"path":"B:\\proj","title":"B","sessionIds":["s2"],"createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"}}}}"#).unwrap();
         fs::create_dir_all(&repo).unwrap();
         adopt_home(&repo, &home_a, "A").unwrap();
         adopt_home(&repo, &home_b, "B").unwrap();
@@ -2419,6 +2472,18 @@ mod tests {
         // 目标端独有的会话必须还在（这是本次修复的核心）
         assert!(home_b.join("sessions").join("pB").join("s2").join("session.jsonl.zstd").is_file(),
             "合并模式下目标端独有的对话绝不能被删除");
+        // v8：登记表也必须真合并——目标端原登记（s2）保留，来源端登记（s1）并入。
+        // 旧实现会先用来源的 workspace.json 覆盖目标，导致这里的 s2 登记消失。
+        let ws_text = fs::read_to_string(home_b.join("storages").join("workspace.json")).unwrap();
+        let ws: serde_json::Value = serde_json::from_str(&ws_text).unwrap();
+        let tables = ws["tables"]["workspaces"].as_object().unwrap();
+        let all_ids: Vec<String> = tables
+            .values()
+            .flat_map(|w| w["sessionIds"].as_array().cloned().unwrap_or_default())
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(all_ids.iter().any(|v| v == "s2"), "目标端原登记 s2 必须保留");
+        assert!(all_ids.iter().any(|v| v == "s1"), "来源端登记 s1 应并入");
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -2427,10 +2492,17 @@ mod tests {
         // v7：磁盘上有、workspace.json 没登记的对话 → 修复登记后应被登记
         let base = std::env::temp_dir().join(format!("dsh-vault-repair-{}", uuid::Uuid::new_v4()));
         let home = base.join("home");
-        let cwd = "E:\\proj";
-        let dir = home.join("sessions").join("--E-proj--").join("session-orphan-1");
+        // v8：官方只认「cwd 真实存在」的会话（realpath + isDirectory），
+        // 测试必须用真实目录，否则构造的是官方根本不会显示的场景。
+        let real_cwd = base.join("proj");
+        fs::create_dir_all(&real_cwd).unwrap();
+        let cwd = real_cwd.to_string_lossy().to_string();
+        let dir = home.join("sessions").join(crate::project_key::project_key(&cwd)).join("session-orphan-1");
         fs::create_dir_all(&dir).unwrap();
-        let header = "{\"type\":\"session\",\"version\":0,\"id\":\"session-orphan-1\",\"createdAt\":123,\"cwd\":\"E:\\\\proj\",\"agentPreset\":\"standard\"}\n";
+        let header = format!(
+            "{{\"type\":\"session\",\"version\":0,\"id\":\"session-orphan-1\",\"createdAt\":123,\"cwd\":{},\"agentPreset\":\"standard\"}}\n",
+            serde_json::to_string(&cwd).unwrap()
+        );
         let mut bytes = zstd::encode_all(std::io::Cursor::new(header.as_bytes()), 3).unwrap();
         bytes.extend_from_slice(&zstd::encode_all(std::io::Cursor::new(b"{\"type\":\"user/message\"}\n"), 3).unwrap());
         fs::write(dir.join("session.jsonl.zstd"), &bytes).unwrap();
@@ -2463,17 +2535,23 @@ mod tests {
         adopt_home(&repo, &home, "X").unwrap();
         let home_id = home_id_of(&home);
         // 造一个切换快照，里面有会话
-        let cwd = "E:\\lost";
-        let snap_sess = repo.join("switch-backups").join(&home_id).join("snap-1").join("sessions").join("--E-lost--").join("session-lost-1");
+        // v8：cwd 用真实存在的目录，否则官方不会显示该会话，登记也留不住
+        let real_lost = base.join("lost");
+        fs::create_dir_all(&real_lost).unwrap();
+        let cwd = real_lost.to_string_lossy().to_string();
+        let snap_sess = repo.join("switch-backups").join(&home_id).join("snap-1").join("sessions").join(crate::project_key::project_key(&cwd)).join("session-lost-1");
         fs::create_dir_all(&snap_sess).unwrap();
-        let header = "{\"type\":\"session\",\"version\":0,\"id\":\"session-lost-1\",\"createdAt\":1,\"cwd\":\"E:\\\\lost\"}\n";
+        let header = format!(
+            "{{\"type\":\"session\",\"version\":0,\"id\":\"session-lost-1\",\"createdAt\":1,\"cwd\":{}}}\n",
+            serde_json::to_string(&cwd).unwrap()
+        );
         let mut bytes = zstd::encode_all(std::io::Cursor::new(header.as_bytes()), 3).unwrap();
         bytes.extend_from_slice(&zstd::encode_all(std::io::Cursor::new(b"{\"type\":\"user/message\"}\n"), 3).unwrap());
         fs::write(snap_sess.join("session.jsonl.zstd"), &bytes).unwrap();
 
         let rep = crate::migrate::restore_sessions_from_snapshot(&repo, &home, "snap-1").unwrap();
         assert_eq!(rep.restored, 1, "应找回 1 条");
-        assert!(home.join("sessions").join("--E-lost--").join("session-lost-1").join("session.jsonl.zstd").is_file(), "会话文件应放回目标");
+        assert!(home.join("sessions").join(crate::project_key::project_key(&cwd)).join("session-lost-1").join("session.jsonl.zstd").is_file(), "会话文件应放回目标");
         // 并且被登记
         let doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join("storages").join("workspace.json")).unwrap()).unwrap_or(serde_json::json!({}));
         let mut found = false;

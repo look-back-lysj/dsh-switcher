@@ -1,6 +1,6 @@
 [package]
 name = "dsh-vault"
-version = "0.1.0"
+version = "0.2.0"
 description = "DeepSeek Harness 备份、迁移与恢复工具"
 authors = ["DSH Vault"]
 edition = "2021"

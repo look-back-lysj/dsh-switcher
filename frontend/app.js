@@ -398,6 +398,7 @@ async function previewRestore() {
       ids: filter.ids,
       project: filter.project,
       mode: $('restore-mode').value,
+      snapshot: null,
     });
     state.preview = preview;
     $('execute-restore').disabled = preview.items.length === 0;
@@ -493,11 +494,12 @@ async function executeRestore() {
       ids: filter.ids,
       project: filter.project,
       mode: $('restore-mode').value,
+      snapshot: null,
     });
     showResult($('restore-result'), [
       `恢复完成：新建 ${result.created}，跳过 ${result.skipped}，覆盖 ${result.overwritten}。`,
       result.snapshot ? `覆盖前快照：` + result.snapshot : '',
-    ].filter(Boolean).join('\\n'));
+    ].filter(Boolean).join('\n'));
   } catch (error) {
     showResult($('restore-result'), `恢复失败：${error.message}`, true);
   } finally {
@@ -802,11 +804,13 @@ async function tmRestoreSnapshot() {
     const result = await invoke('restore', {
       repo: $('backup-repo').value,
       scope: 'home',
-      mode: 'fill_missing',
+      mode: 'force',
       sourceHomeId: homeId || null,
       targetHome: homePath || null,
       ids: [],
       project: null,
+      // v8：真正回到所选快照（旧行为是拿最新清单补缺，和按钮名字不符）
+      snapshot: snap.id,
     });
     showResult($('tm-result'), `恢复完成：新建 ${result.created}，跳过 ${result.skipped}，失败 ${result.failed}。`, false);
     refreshSnapshots();
@@ -1405,6 +1409,12 @@ async function doSwitch() {
     if (result.registryRepaired > 0) {
       msg += `\n\n顺便修复了 ${result.registryRepaired} 条"磁盘上有、侧栏没登记"的对话。`;
     }
+    if (result.sessionsMissingDir > 0) {
+      msg += `\n\n注意：有 ${result.sessionsMissingDir} 条对话的原工作目录在这台电脑上不存在，DSH 官方版不会显示它们。可以先重建原目录，或用「迁移」把它们迁到存在的工作区。`;
+    }
+    if (result.sessionsArchived > 0) {
+      msg += `\n\n另有 ${result.sessionsArchived} 条对话处于「已归档」状态，DSH 默认隐藏它们；在侧栏把筛选切到「全部对话（显示已归档）」即可看到。`;
+    }
     if (result.settingsCopied) {
       msg += `\n\n模型提供方配置已一并带过去（settings.yaml）。请重启「${t?.label}」，它启动时会自动导入这份配置。`;
     }
@@ -1644,6 +1654,15 @@ async function doRestoreSnapshot(snapshotName) {
     let msg = `找回完成：恢复 ${rep.restored} 条对话（跳过已存在的 ${rep.skipped} 条）`;
     if (rep.registered) msg += `，并补登记 ${rep.registered} 条`;
     msg += '。请重启目标 DSH 查看。';
+    if (rep.missingDir > 0) {
+      msg += `\n\n注意：其中 ${rep.missingDir} 条的原工作目录已不存在，官方版不会显示它们。可以先重建原目录，或用「迁移」把它们迁到存在的工作区。`;
+    }
+    if (rep.noCwd > 0) {
+      msg += `\n\n另有 ${rep.noCwd} 条没有记录工作目录，无法判断归属。`;
+    }
+    if (rep.archived > 0) {
+      msg += `\n\n另有 ${rep.archived} 条处于「已归档」状态，默认不显示；在侧栏切到「全部对话（显示已归档）」即可看到。`;
+    }
     showResult($('recover-result'), msg, false);
     renderRouteCheck(tgt);
   } catch (e) {
@@ -1663,7 +1682,18 @@ async function doRepairRegistry() {
       invoke('repair_registry', { targetHome: tgt }));
     let msg = rep.registered > 0
       ? `修复完成：补登记 ${rep.registered} 条对话（已存在 ${rep.already} 条）。重启 DSH 后即可在侧栏看到。`
-      : '检查完毕：所有对话都已正常登记，无需修复。';
+      : ((rep.missingDir > 0 || rep.noCwd > 0)
+          ? `检查完毕：没有可补登记的对话（已登记 ${rep.already} 条）。`
+          : '检查完毕：所有对话都已正常登记，无需修复。');
+    if (rep.missingDir > 0) {
+      msg += `\n\n注意：还有 ${rep.missingDir} 条对话的原工作目录已不存在，官方版不会显示它们（登记了也会被过滤）。可以先重建原目录，或用「迁移」把它们迁到存在的工作区。`;
+    }
+    if (rep.noCwd > 0) {
+      msg += `\n\n另有 ${rep.noCwd} 条对话没有记录工作目录，无法判断归属，未做登记。`;
+    }
+    if (rep.archived > 0) {
+      msg += `\n\n另有 ${rep.archived} 条对话处于「已归档」状态，默认不显示；在侧栏切到「全部对话（显示已归档）」即可看到。`;
+    }
     showResult($('recover-result'), msg, false);
     renderRouteCheck(tgt);
   } catch (e) {

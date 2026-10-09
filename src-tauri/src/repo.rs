@@ -187,7 +187,11 @@ pub fn default_repo() -> String {
 }
 
 pub fn load_manifest(repo: &Path) -> Result<Manifest, String> {
-    let path = repo.join("manifest.json");
+    load_manifest_from(&repo.join("manifest.json"))
+}
+
+/// 从任意清单文件读取并校验（用于历史快照自带的 manifest.json）。
+pub fn load_manifest_from(path: &Path) -> Result<Manifest, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("无法读取仓库清单：{e}"))?;
     let manifest: Manifest =
         serde_json::from_str(&text).map_err(|e| format!("仓库清单格式不正确：{e}"))?;
@@ -213,11 +217,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
         if !is_safe_repo_path(&file.path) {
             return Err(format!("仓库文件路径不安全：{}", file.path));
         }
-        let effective_rel = if file.rel.is_empty() {
-            file.path.strip_prefix(&format!("blobs/{}/", file.root)).unwrap_or("").replace("\\\\", "/")
-        } else {
-            file.rel.clone()
-        };
+        let effective_rel = normalize_rel(file);
         if !is_safe_rel_path(&effective_rel) {
             return Err(format!("恢复路径不安全：{effective_rel}"));
         }
@@ -242,11 +242,50 @@ fn is_safe_component(value: &str) -> bool {
         && !value.contains(':')
 }
 
+/// 取文件的恢复目标相对路径（rel）。旧仓库可能没有 rel 字段，
+/// 这时从 blob 的仓库内路径反推；两种 blob 布局都支持：
+/// - 旧版（v4 及更早）：blobs/<homeId>/<rel>
+/// - v5 起：snapshots/<snapId>/files/<homeId>/<rel>
+fn normalize_rel(file: &ManifestFile) -> String {
+    if !file.rel.is_empty() {
+        return file.rel.replace('\\', "/");
+    }
+    infer_rel_from_repo_path(&file.path, &file.root).unwrap_or_default()
+}
+
+fn infer_rel_from_repo_path(path: &str, root: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix(&format!("blobs/{root}/")) {
+        if !rest.is_empty() {
+            return Some(rest.to_string());
+        }
+    }
+    if let Some(rest) = normalized.strip_prefix("snapshots/") {
+        if let Some(index) = rest.find("/files/") {
+            let after = &rest[index + "/files/".len()..];
+            if let Some(rel) = after.strip_prefix(&format!("{root}/")) {
+                if !rel.is_empty() {
+                    return Some(rel.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 拒绝路径逃逸。备份清单本质上是外部输入，不能直接信任其中的相对路径。
+/// 允许两种仓库内布局：blobs/<homeId>/... 与 snapshots/<snapId>/files/<homeId>/...
 fn is_safe_repo_path(value: &str) -> bool {
-    if !value.starts_with("blobs/") {
+    let normalized = value.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
+    if parts.len() < 3 || !parts.iter().all(|part| is_safe_component(part)) {
         return false;
     }
-    value.split('/').all(is_safe_component)
+    match parts[0] {
+        "blobs" => true,
+        "snapshots" => parts.len() >= 4 && parts[2] == "files",
+        _ => false,
+    }
 }
 
 pub fn is_safe_rel_path(value: &str) -> bool {
@@ -333,7 +372,13 @@ fn previous_index(manifest: Option<&Manifest>) -> HashMap<String, ManifestFile> 
     let mut map = HashMap::new();
     if let Some(manifest) = manifest {
         for file in &manifest.files {
-            map.insert(format!("{}|{}", file.root, file.path), file.clone());
+            let rel = normalize_rel(file);
+            if rel.is_empty() {
+                continue;
+            }
+            // v8：用稳定的 rel 做增量去重键。v5 起 blob 路径带快照 id，
+            // 用 file.path 做键会导致每次备份都 miss、仓库无限膨胀。
+            map.insert(format!("{}|{}", file.root, rel), file.clone());
         }
     }
     map
@@ -409,7 +454,7 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
             // 旧结构路径（用于增量去重判断）
             let old_blob_rel = format!("blobs/{}/{}", discovered.id, rel);
             let old_blob_abs = repo.join(&old_blob_rel);
-            let key = format!("{}|{}", discovered.id, old_blob_rel);
+            let key = format!("{}|{}", discovered.id, rel);
             let prev = previous_by_path.get(&key);
             let unchanged = prev
                 .as_ref()
@@ -417,7 +462,10 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
             if unchanged {
                 let prev = prev.cloned().unwrap();
                 // 复用旧 blob：优先硬链接到本快照目录（省空间且快照独立）
-                let source_abs = if old_blob_abs.is_file() { old_blob_abs.clone() } else { repo.join(&prev.path) };
+let source_abs = {
+                    let prev_abs = repo.join(&prev.path);
+                    if prev_abs.is_file() { prev_abs } else { old_blob_abs.clone() }
+                };
                 if let Some(parent) = blob_abs.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
@@ -528,7 +576,7 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
                 let blob_abs = repo.join(&blob_rel);
                 let old_blob_rel = format!("blobs/{}/{}", agents.id, file.rel);
                 let old_blob_abs = repo.join(&old_blob_rel);
-                let key = format!("{}|{}", agents.id, old_blob_rel);
+                let key = format!("{}|{}", agents.id, file.rel);
                 let prev = previous_by_path.get(&key);
                 let unchanged = prev
                     .as_ref()
@@ -538,7 +586,10 @@ pub fn run_backup(repo_text: &str, note: &str, only_config: bool, app: Option<&A
                     if let Some(parent) = blob_abs.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
-                    let source_abs = if old_blob_abs.is_file() { old_blob_abs.clone() } else { repo.join(&prev.path) };
+let source_abs = {
+                        let prev_abs = repo.join(&prev.path);
+                        if prev_abs.is_file() { prev_abs } else { old_blob_abs.clone() }
+                    };
                     if source_abs.is_file() && !blob_abs.is_file() {
                         if fs::hard_link(&source_abs, &blob_abs).is_err() {
                             let _ = fs::copy(&source_abs, &blob_abs);
@@ -750,4 +801,71 @@ pub fn list_snapshots(repo: &Path) -> Result<Vec<SnapshotInfo>, String> {
     // 按时间倒序
     snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(snapshots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mkfile(root: &str, path: &str, rel: &str) -> ManifestFile {
+        ManifestFile {
+            root: root.into(),
+            path: path.into(),
+            size: 10,
+            mtime_ms: MTime::Millis(0),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            status: "ok".into(),
+            kind: "session".into(),
+            rel: rel.into(),
+            credential_placeholder: false,
+        }
+    }
+
+    #[test]
+    fn snapshot_blob_paths_are_valid() {
+        // v8 回归：v5 起 blob 写在 snapshots/<id>/files/ 下，校验必须放行，
+        // 否则整仓库的恢复/校验/导出都会报「仓库文件路径不安全」。
+        assert!(is_safe_repo_path(
+            "snapshots/20261009-211915/files/root-1/settings.yaml.imported"
+        ));
+        assert!(is_safe_repo_path("blobs/root-1/settings.yaml.imported"));
+        assert!(!is_safe_repo_path("snapshots/x/other/root/rel"));
+        assert!(!is_safe_repo_path("snapshots/../../evil"));
+        assert_eq!(
+            infer_rel_from_repo_path(
+                "snapshots/20261009-211915/files/root-1/sessions/a/b.jsonl.zstd",
+                "root-1"
+            )
+            .as_deref(),
+            Some("sessions/a/b.jsonl.zstd")
+        );
+        assert_eq!(
+            infer_rel_from_repo_path("blobs/root-1/settings.yaml", "root-1").as_deref(),
+            Some("settings.yaml")
+        );
+    }
+
+    #[test]
+    fn previous_index_reuses_files_across_snapshot_ids() {
+        // v8 回归：跨快照增量去重要能命中（旧实现用带快照 id 的 path 做键，永远 miss，
+        // 每次备份都全量复制，仓库随备份次数线性膨胀）。
+        let manifest = Manifest {
+            version: 2,
+            tool: "dsh-vault".into(),
+            created_at: "2026-10-09T00:00:00".into(),
+            host: "test".into(),
+            note: String::new(),
+            homes: vec![],
+            files: vec![mkfile(
+                "root-1",
+                "snapshots/20261009-111111/files/root-1/sessions/--E-x--/s/session.v4.jsonl.zstd",
+                "sessions/--E-x--/s/session.v4.jsonl.zstd",
+            )],
+            warnings: vec![],
+        };
+        let index = previous_index(Some(&manifest));
+        assert!(index
+            .get("root-1|sessions/--E-x--/s/session.v4.jsonl.zstd")
+            .is_some());
+    }
 }

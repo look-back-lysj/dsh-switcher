@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::repo::{atomic_write, is_safe_rel_path, load_manifest, Manifest, ManifestFile, RestoreMode, RestoreScope};
+use crate::repo::{atomic_write, is_safe_rel_path, load_manifest, load_manifest_from, Manifest, ManifestFile, RestoreMode, RestoreScope};
 use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +30,9 @@ pub struct RestoreFilter {
     pub project: Option<String>,
     pub mode: RestoreMode,
     pub since: Option<String>,
+    /// v8：从历史快照恢复时传入 snapshots/<id> 的目录名；为空则用仓库当前清单。
+    #[serde(default)]
+    pub snapshot: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -356,6 +359,22 @@ fn matches_scope(file: &ManifestFile, scope: RestoreScope) -> bool {
     }
 }
 
+/// 选择本次恢复要用的清单：默认当前清单；指定快照时用该快照目录里的清单。
+/// 注意：快照清单里的 file.path 仍是「相对仓库根」的位置（v5+ 的 blob 都写在
+/// snapshots/<id>/files/ 下），所以读取源文件时仍以 repo 为根，不能以快照目录为根。
+fn manifest_for(repo: &Path, filter: &RestoreFilter) -> Result<Manifest, String> {
+    match filter.snapshot.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            if !is_safe_rel_path(&format!("snapshots/{id}")) {
+                return Err("快照名称不合法。".to_string());
+            }
+            let path = repo.join("snapshots").join(id).join("manifest.json");
+            load_manifest_from(&path).map_err(|e| format!("读取历史快照「{id}」的清单失败：{e}"))
+        }
+        None => load_manifest(repo),
+    }
+}
+
 fn target_for(manifest: &Manifest, filter: &RestoreFilter) -> Result<PathBuf, String> {
     if let Some(path) = &filter.target_home {
         return Ok(PathBuf::from(path));
@@ -397,7 +416,7 @@ fn restored_rel(file: &ManifestFile) -> Result<String, String> {
 }
 
 pub fn preview_restore(repo: &Path, filter: RestoreFilter) -> Result<RestorePreview, String> {
-    let manifest = load_manifest(repo)?;
+    let manifest = manifest_for(repo, &filter)?;
     let target = target_for(&manifest, &filter)?;
     let mut items = Vec::new();
     let mut create_count = 0u32;
@@ -523,7 +542,7 @@ pub fn run_restore(
     filter: RestoreFilter,
     app: Option<&AppHandle>,
 ) -> Result<RestoreResult, String> {
-    let manifest = load_manifest(repo)?;
+    let manifest = manifest_for(repo, &filter)?;
     let target = target_for(&manifest, &filter)?;
     if dsh_running() {
         return Err("检测到 DSH 正在运行。请先完全退出 DSH，再执行恢复。".into());
@@ -849,12 +868,105 @@ mod tests {
             project: None,
             mode: crate::repo::RestoreMode::Force, // 即使强制覆盖也不许动凭据
             since: None,
+            snapshot: None,
         };
         let result = run_restore(&repo, filter, None).expect("恢复应成功（凭据被跳过）");
         assert_eq!(result.created, 0, "不应新建任何文件");
         assert_eq!(result.skipped, 1, "凭据占位符应计入跳过");
         let after = std::fs::read(&real_cred).unwrap();
         assert_eq!(before, after, "目标真实凭据绝不允许被空壳覆盖");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn restore_from_history_snapshot_manifest() {
+        // v8 回归：含 snapshots/<id>/files/ 形态 blob 的清单必须能通过校验与恢复；
+        // 指定 snapshot 时，用该历史快照自己的 manifest.json 恢复。
+        if dsh_running() {
+            eprintln!("skip: DSH 正在运行");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("dsh-vault-snaprestore-{}", uuid::Uuid::new_v4()));
+        let repo = base.join("repo");
+        let target = base.join("target");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let snap_id = "20261009-211915";
+        let blob_dir = repo.join("snapshots").join(snap_id).join("files").join("root-1");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        let content = b"restored-from-snapshot";
+        std::fs::write(blob_dir.join("note.txt"), content).unwrap();
+        let sha = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(content);
+            format!("{:x}", hasher.finalize())
+        };
+        let manifest = Manifest {
+            version: 2,
+            tool: "dsh-vault".into(),
+            created_at: "2026-10-09T21:19:15".into(),
+            host: "test".into(),
+            note: String::new(),
+            homes: vec![ManifestHome {
+                id: "root-1".into(),
+                kind: HomeKind::DshHome,
+                label: "测试".into(),
+                path: target.to_string_lossy().to_string(),
+                variant: "unknown".into(),
+                dsh_version: None,
+                sessions: SessionStats::default(),
+            }],
+            files: vec![ManifestFile {
+                root: "root-1".into(),
+                path: format!("snapshots/{snap_id}/files/root-1/note.txt"),
+                size: content.len() as u64,
+                mtime_ms: MTime::Millis(0),
+                sha256: sha,
+                status: "ok".into(),
+                kind: "config".into(),
+                rel: "note.txt".into(),
+                credential_placeholder: false,
+            }],
+            warnings: vec![],
+        };
+        let text = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(repo.join("manifest.json"), &text).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots").join(snap_id)).unwrap();
+        std::fs::write(
+            repo.join("snapshots").join(snap_id).join("manifest.json"),
+            &text,
+        )
+        .unwrap();
+
+        // 情景一：用当前清单（内含 snapshots 形态路径）预览——修复前这里必然报路径不安全。
+        let filter = RestoreFilter {
+            scope: RestoreScope::Home,
+            source_home_id: Some("root-1".into()),
+            target_home: None,
+            ids: Vec::new(),
+            project: None,
+            mode: RestoreMode::FillMissing,
+            since: None,
+            snapshot: None,
+        };
+        let preview = preview_restore(&repo, filter).expect("snapshots 形态清单应能通过校验");
+        assert_eq!(preview.create_count, 1);
+
+        // 情景二：指定历史快照恢复。
+        let filter2 = RestoreFilter {
+            scope: RestoreScope::Home,
+            source_home_id: Some("root-1".into()),
+            target_home: None,
+            ids: Vec::new(),
+            project: None,
+            mode: RestoreMode::FillMissing,
+            since: None,
+            snapshot: Some(snap_id.into()),
+        };
+        let result = run_restore(&repo, filter2, None).expect("历史快照恢复应成功");
+        assert_eq!(result.created, 1);
+        assert_eq!(std::fs::read(target.join("note.txt")).unwrap(), content);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

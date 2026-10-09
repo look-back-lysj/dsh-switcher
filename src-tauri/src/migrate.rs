@@ -17,6 +17,25 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// 复刻官方 realpathNormalize（Node fs.realpath）：解析链接/短名/`..`，
+/// 并去掉 Windows verbatim 前缀（\\?\），让写进 workspace.json 的 path
+/// 与 DSH 内部 sessionPath 的字符串完全一致——对不上时，官方一次 mutate
+/// 就会把这条会话登记当作「不再匹配」清掉。
+pub(crate) fn realpath_like(path: &str) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    Some(strip_verbatim_prefix(&canonical.to_string_lossy()))
+}
+
+fn strip_verbatim_prefix(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 /// 一条会话在磁盘上的定位与 header 元数据
 #[derive(Debug, Clone)]
 pub struct SessionEntry {
@@ -340,11 +359,19 @@ fn append_to_workspace_index(target_home: &Path, cwd: &str, new_session_ids: &[S
     }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    // 在 tables.workspaces 里找 path 匹配的工作区
+    // v8：把 cwd 规范化为官方 realpathNormalize 的形态（目录存在时）。
+    // 官方的 sessionPath 是 realpath 结果，字符串对不上时，官方一次 mutate
+    // 就会把这条会话登记当作「不再匹配」清掉。
+    let cwd_norm = realpath_like(cwd).unwrap_or_else(|| cwd.replace('/', "\\"));
+
+    // 在 tables.workspaces 里找 path 匹配的工作区（先精确，再按 realpath 规范化比较）
     let ws_table = doc["tables"]["workspaces"].as_object_mut().ok_or("tables.workspaces 不是对象")?;
     let mut target_key: Option<String> = None;
     for (k, v) in ws_table.iter() {
-        if v.get("path").and_then(|x| x.as_str()) == Some(cwd) {
+        let Some(entry_path) = v.get("path").and_then(|x| x.as_str()) else { continue };
+        let matched = entry_path == cwd_norm
+            || realpath_like(entry_path).map(|p| p == cwd_norm).unwrap_or(false);
+        if matched {
             target_key = Some(k.clone());
             break;
         }
@@ -357,7 +384,7 @@ fn append_to_workspace_index(target_home: &Path, cwd: &str, new_session_ids: &[S
         // 新建工作区条目（title 取 cwd 末段）
         let title = cwd.rsplit(['\\', '/']).find(|s| !s.is_empty()).unwrap_or(cwd).to_string();
         ws_table.insert(key.clone(), serde_json::json!({
-            "path": cwd,
+            "path": cwd_norm,
             "title": title,
             "sessionIds": [],
             "createdAt": now,
@@ -366,7 +393,11 @@ fn append_to_workspace_index(target_home: &Path, cwd: &str, new_session_ids: &[S
     }
     // 追加 sessionIds（去重），并刷新 updatedAt
     let entry = ws_table.get_mut(&key).ok_or("工作区条目缺失")?;
-    if entry.get("path").is_none() { entry["path"] = serde_json::json!(cwd); }
+    if entry.get("path").is_none() { entry["path"] = serde_json::json!(cwd_norm); }
+    // 已有记录的 path 若不是 realpath 形态，顺手修正，避免官方启动后被过滤清除
+    if entry.get("path").and_then(|x| x.as_str()) != Some(cwd_norm.as_str()) {
+        entry["path"] = serde_json::json!(cwd_norm);
+    }
     if entry.get("sessionIds").is_none() { entry["sessionIds"] = serde_json::json!([]); }
     let arr = entry["sessionIds"].as_array_mut().ok_or("sessionIds 不是数组")?;
     for id in new_session_ids {
@@ -600,11 +631,15 @@ pub(crate) fn merge_workspace_json(target_file: &Path, source_file: &Path) -> Re
     for (_src_id, src_ws) in src_workspaces.iter() {
         let src_path = src_ws.get("path").and_then(|x| x.as_str()).unwrap_or("");
         if src_path.is_empty() { continue; }
-        // 找目标端同 path 的工作区
+        // 找目标端同 path 的工作区（v8：按官方 realpath 形态比较，兼容旧记录）
+        let src_path_norm = realpath_like(src_path).unwrap_or_else(|| src_path.replace('/', "\\"));
         let mut found_key: Option<String> = None;
         if let Some(ws_map) = tgt["tables"]["workspaces"].as_object() {
             for (k, v) in ws_map.iter() {
-                if v.get("path").and_then(|x| x.as_str()) == Some(src_path) { found_key = Some(k.clone()); break; }
+                let Some(entry_path) = v.get("path").and_then(|x| x.as_str()) else { continue };
+                let matched = entry_path == src_path_norm
+                    || realpath_like(entry_path).map(|p| p == src_path_norm).unwrap_or(false);
+                if matched { found_key = Some(k.clone()); break; }
             }
         }
         match found_key {
@@ -612,6 +647,9 @@ pub(crate) fn merge_workspace_json(target_file: &Path, source_file: &Path) -> Re
                 // 已有工作区：sessionIds 取并集（目标原有的全部保留）
                 let entry = &mut tgt["tables"]["workspaces"][&k];
                 if entry.get("sessionIds").is_none() { entry["sessionIds"] = serde_json::json!([]); }
+                if entry.get("path").and_then(|x| x.as_str()) != Some(src_path_norm.as_str()) {
+                    entry["path"] = serde_json::json!(src_path_norm);
+                }
                 let src_ids: Vec<String> = src_ws.get("sessionIds").and_then(|x| x.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
                 if let Some(arr) = entry["sessionIds"].as_array_mut() {
@@ -627,7 +665,10 @@ pub(crate) fn merge_workspace_json(target_file: &Path, source_file: &Path) -> Re
                 if tgt["tables"]["workspaces"].get(&new_id).is_some() { new_id = uuid::Uuid::new_v4().to_string(); }
                 let count = src_ws.get("sessionIds").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
                 let mut entry = src_ws.clone();
-                if let Some(obj) = entry.as_object_mut() { obj.remove("id"); }
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.remove("id");
+                    obj.insert("path".to_string(), serde_json::json!(src_path_norm));
+                }
                 tgt["tables"]["workspaces"][&new_id] = entry;
                 if let Some(ids) = tgt["global"]["workspaceIds"].as_array_mut() {
                     if !ids.iter().any(|x| x.as_str() == Some(new_id.as_str())) { ids.push(serde_json::json!(new_id)); }
@@ -661,6 +702,14 @@ pub struct RegistryRepairReport {
     pub registered: usize,
     pub already: usize,
     pub cache_written: usize,
+    /// v8：header 里没有 cwd、无法判断归属的会话数
+    pub no_cwd: usize,
+    /// v8：cwd 目录已不存在/无法解析的会话数（官方版不会显示它们）
+    pub missing_dir: usize,
+    /// v8：已登记但在归档名单里、官方默认隐藏的会话数
+    pub archived: usize,
+    /// v8：无法登记的原因示例（最多 8 条）
+    pub issues: Vec<String>,
     pub notes: Vec<String>,
 }
 
@@ -685,7 +734,14 @@ pub fn repair_session_registry(target_home: &Path) -> Result<RegistryRepairRepor
     let mut by_cwd: std::collections::BTreeMap<String, Vec<(String, u64, u32)>> = std::collections::BTreeMap::new();
     for e in &all {
         if registered.contains(&e.id) { rep.already += 1; continue; }
-        let Some(cwd) = e.cwd.clone() else { continue };
+        let Some(cwd_raw) = e.cwd.clone() else { rep.no_cwd += 1; continue };
+        let Some(cwd) = realpath_like(&cwd_raw) else {
+            rep.missing_dir += 1;
+            if rep.issues.len() < 8 {
+                rep.issues.push(format!("{}（原目录 {} 不存在）", e.id, cwd_raw));
+            }
+            continue;
+        };
         by_cwd.entry(cwd).or_default().push((e.id.clone(), e.created_at_ms, e.generation));
         rep.registered += 1;
     }
@@ -700,8 +756,38 @@ pub fn repair_session_registry(target_home: &Path) -> Result<RegistryRepairRepor
     }
     if rep.registered > 0 {
         rep.notes.push(format!("已把 {} 条磁盘上有、但侧栏没登记的对话登记回去了（下次打开 DSH 即可看到）。", rep.registered));
-    } else {
+    } else if rep.missing_dir == 0 && rep.no_cwd == 0 {
         rep.notes.push("所有对话都已正常登记，无需修复。".to_string());
+    }
+    if rep.no_cwd > 0 {
+        rep.notes.push(format!("有 {} 条对话的 header 里没有记录工作目录，无法判断归属，未做登记。", rep.no_cwd));
+    }
+    // v8：统计处于归档名单里的会话——官方默认「隐藏已归档」，用户会误以为没迁过来。
+    let mut archived_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(text) = fs::read_to_string(&ws_file) {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(arr) = doc.pointer("/global/archivedSessionIds").and_then(|x| x.as_array()) {
+                for v in arr {
+                    if let Some(id) = v.as_str() {
+                        archived_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    rep.archived = all.iter().filter(|e| archived_ids.contains(&e.id)).count();
+    if rep.archived > 0 {
+        rep.notes.push(format!(
+            "另有 {} 条对话处于「已归档」状态，DSH 默认隐藏它们；在侧栏把筛选切到「全部对话（显示已归档）」即可看到。",
+            rep.archived
+        ));
+    }
+    if rep.missing_dir > 0 {
+        rep.notes.push(format!(
+            "另有 {} 条对话的原工作目录已不存在，官方版不会显示它们（登记了也会被过滤）。例如：{}。可以先重建原目录，或用「迁移」把这些对话迁到存在的工作区。",
+            rep.missing_dir,
+            rep.issues.join("；")
+        ));
     }
     Ok(rep)
 }
@@ -713,6 +799,15 @@ pub struct SnapshotRestoreReport {
     pub skipped: usize,
     pub registered: usize,
     pub snapshot: String,
+    /// v8：找回后仍因原目录不存在而无法显示的条数
+    #[serde(default)]
+    pub missing_dir: usize,
+    /// v8：header 没有 cwd、无法判断归属的条数
+    #[serde(default)]
+    pub no_cwd: usize,
+    /// v8：找回后仍处于归档名单、默认隐藏的条数
+    #[serde(default)]
+    pub archived: usize,
 }
 
 /// 从某次切换保险快照里把"目标端当前缺失的对话"找回来（只增不删），并自动登记。
@@ -732,7 +827,15 @@ pub fn restore_sessions_from_snapshot(
     }
     let current: std::collections::HashSet<String> =
         list_sessions(target_home).into_iter().map(|e| e.id).collect();
-    let mut report = SnapshotRestoreReport { restored: 0, skipped: 0, registered: 0, snapshot: snapshot_name.to_string() };
+    let mut report = SnapshotRestoreReport {
+        restored: 0,
+        skipped: 0,
+        registered: 0,
+        snapshot: snapshot_name.to_string(),
+        missing_dir: 0,
+        no_cwd: 0,
+        archived: 0,
+    };
 
     for proj in fs::read_dir(&snap_root).into_iter().flatten().flatten() {
         let Ok(sessions) = fs::read_dir(proj.path()) else { continue };
@@ -752,6 +855,9 @@ pub fn restore_sessions_from_snapshot(
     if report.restored > 0 {
         let repair = repair_session_registry(target_home)?;
         report.registered = repair.registered;
+        report.missing_dir = repair.missing_dir;
+        report.no_cwd = repair.no_cwd;
+        report.archived = repair.archived;
     }
     Ok(report)
 }
@@ -759,6 +865,32 @@ pub fn restore_sessions_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realpath_like_matches_existing_dir_and_rejects_missing() {
+        // v8：写进 workspace.json 的 path 必须与官方 realpathNormalize 的形态一致，
+        // 否则官方 mutate 时会把登记当作不匹配清掉。
+        let base = std::env::temp_dir().join(format!("dsh-vault-realpath-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let got = realpath_like(&base.to_string_lossy()).expect("存在的目录应可解析");
+        assert!(!got.starts_with(r"\\?\"), "必须去掉 Windows verbatim 前缀");
+        assert!(std::path::Path::new(&got).is_dir());
+        assert!(realpath_like(&base.join("not-exist").to_string_lossy()).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn repair_reports_sessions_with_missing_cwd() {
+        // v8：cwd 目录不存在的会话不登记（官方本来就不会显示），但必须在报告里说出来。
+        let base = std::env::temp_dir().join(format!("dsh-vault-repairmiss-{}", uuid::Uuid::new_v4()));
+        let home = base.join("home");
+        make_session(&home, "E:\\gone", "session-gone-1", None, "standard");
+        let rep = repair_session_registry(&home).unwrap();
+        assert_eq!(rep.registered, 0, "目录不存在的会话不应登记");
+        assert_eq!(rep.missing_dir, 1, "应报告 1 条缺目录会话");
+        assert!(rep.notes.iter().any(|n| n.contains("不存在")), "报告里应有人话解释");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// 造一条 zstd 会话（header + body 两帧），返回相对 home 的 sessions/<proj>/<sess>
     fn make_session(home: &Path, cwd: &str, id: &str, parent: Option<&str>, preset: &str) {

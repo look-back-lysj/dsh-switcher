@@ -90,6 +90,7 @@ async fn preview_restore(
     ids: Vec<String>,
     project: Option<String>,
     mode: RestoreMode,
+    snapshot: Option<String>,
 ) -> Result<restore::RestorePreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         preview_restore_impl(&PathBuf::from(repo), restore::RestoreFilter {
@@ -100,6 +101,7 @@ async fn preview_restore(
             mode,
             project,
             since: None,
+            snapshot,
         })
     })
     .await
@@ -115,6 +117,7 @@ async fn restore(app: tauri::AppHandle,
     ids: Vec<String>,
     project: Option<String>,
     mode: RestoreMode,
+    snapshot: Option<String>,
 ) -> Result<restore::RestoreResult, String> {
     let repo_log = repo.clone();
     let tgt_log = target_home.clone().unwrap_or_default();
@@ -127,6 +130,7 @@ async fn restore(app: tauri::AppHandle,
             project,
             mode,
             since: None,
+            snapshot,
         }, Some(&app))
     })
     .await
@@ -625,6 +629,7 @@ fn main() {
                 project: None,
                 mode: RestoreMode::FillMissing,
                 since: None,
+                snapshot: None,
             };
             match run_restore_impl(&PathBuf::from(repo), filter, None) {
                 Ok(result) => println!("{}", serde_json::to_string_pretty(&result).expect("序列化恢复结果失败")),
