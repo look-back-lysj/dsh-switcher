@@ -1299,10 +1299,15 @@ function updateSwitchRoute() {
     // v5：源/目标选定后显示会话级迁移面板
     const mp = $('migrate-panel');
     if (mp) mp.hidden = false;
+    // v7：显示"找回对话/修复登记"面板并加载目标端的历史快照
+    const rp = $('recover-panel');
+    if (rp) { rp.hidden = false; loadSnapshotList(t.path); }
   } else {
     cfg.hidden = true;
     const mp = $('migrate-panel');
     if (mp) mp.hidden = true;
+    const rp2 = $('recover-panel');
+    if (rp2) rp2.hidden = true;
   }
   // 卡片选中态
   document.querySelectorAll('.switch-card').forEach(c => {
@@ -1345,6 +1350,7 @@ async function doSwitch() {
     showResult($('switch-result'), '请至少勾选一种要切换的内容类型。', true);
     return;
   }
+  const replaceMode = $('sw-replace') ? $('sw-replace').checked : false;
   const withCredential = $('sw-config').checked || ($('sw-presets') && $('sw-presets').checked);
   // v4.2 模块C：切换前预检（只读），把风险提示提前摆进确认框
   let preflight = null;
@@ -1355,12 +1361,19 @@ async function doSwitch() {
       targetHome: state.switchTarget,
     });
   } catch (e) { /* 预检失败不阻断切换，只是少了预告 */ }
-  const confirmItems = [
-    `本操作是【替换】：会用「${s?.label}」的${types.join('、')}覆盖「${t?.label}」的同类内容。`,
-    `「${t?.label}」独有的内容会先存进保险快照，万一不对可以切回来。`,
-    '模型提供方配置（settings.yaml）会一并带过去，但 API Key 永远不带（安全设计）。',
-    '请确认所有 DSH 窗口已关闭，切换后请重启目标版本。',
-  ];
+  const confirmItems = replaceMode
+    ? [
+        `本操作是【替换模式】（你手动勾选的）：会用「${s?.label}」的${types.join('、')}覆盖「${t?.label}」的同类内容。`,
+        `「${t?.label}」独有的内容会先存进保险快照，万一不对可以回滚。`,
+        '模型提供方配置会一并带过去，但 API Key 永远不带（安全设计）。',
+        '请确认所有 DSH 窗口已关闭，切换后请重启目标版本。',
+      ]
+    : [
+        `本操作是【合并模式】（默认、安全）：把「${s?.label}」的${types.join('、')}复制到「${t?.label}」。`,
+        `「${t?.label}」已有的对话、技能等内容【不会被删除】。`,
+        '模型提供方配置会一并带过去，但 API Key 永远不带（安全设计）。',
+        '请确认所有 DSH 窗口已关闭，切换后请重启目标版本。',
+      ];
   if (preflight && preflight.notices && preflight.notices.length) {
     preflight.notices.forEach(n => confirmItems.push(n));
   }
@@ -1385,8 +1398,13 @@ async function doSwitch() {
       includeConfig: $('sw-config').checked,
       includeMemories: $('sw-memories').checked,
       includePresets: $('sw-presets') ? $('sw-presets').checked : false,
+      replaceMode: replaceMode,
     }));
-    let msg = `切换完成：${result.switchedLinks} 类内容已从「${s?.label}」切到「${t?.label}」。目标环境的原内容已存入保险快照「${result.backupSnapshot}」。`;
+    const modeText = result.replaceMode ? '替换模式' : '合并模式（目标端已有内容全部保留）';
+    let msg = `切换完成（${modeText}）：${result.switchedLinks} 类内容已从「${s?.label}」带到「${t?.label}」。切换前的状态已存入保险快照「${result.backupSnapshot}」。`;
+    if (result.registryRepaired > 0) {
+      msg += `\n\n顺便修复了 ${result.registryRepaired} 条"磁盘上有、侧栏没登记"的对话。`;
+    }
     if (result.settingsCopied) {
       msg += `\n\n模型提供方配置已一并带过去（settings.yaml）。请重启「${t?.label}」，它启动时会自动导入这份配置。`;
     }
@@ -1576,6 +1594,83 @@ async function doMigrate() {
   }
 }
 
+// v7：列出目标端的历史保险快照，支持"找回对话"
+async function loadSnapshotList(targetHome) {
+  const box = $('snapshot-list');
+  if (!box) return;
+  box.innerHTML = '<div class="migrate-loading">正在读取历史快照…</div>';
+  try {
+    const snaps = await invoke('list_switch_snapshots', { repo: state.defaultRepo, targetHome });
+    if (!snaps || !snaps.length) {
+      box.innerHTML = '<div class="migrate-loading">这个环境还没有历史保险快照（每次切换会自动生成一份）。</div>';
+      return;
+    }
+    box.innerHTML = snaps.map(s => `
+      <div class="migrate-row">
+        <span class="migrate-row-main">
+          <span class="migrate-row-id">${escapeHtml(s.name)}</span>
+          <span class="migrate-row-cwd">${escapeHtml(s.time || '')}${s.fromLabel ? ' · 切自 ' + escapeHtml(s.fromLabel) : ''}</span>
+        </span>
+        <span class="migrate-row-meta">
+          <button class="button compact" data-restore-snap="${escapeHtml(s.name)}" type="button">找回其中的对话</button>
+        </span>
+      </div>`).join('');
+    box.querySelectorAll('[data-restore-snap]').forEach(btn => {
+      btn.addEventListener('click', () => doRestoreSnapshot(btn.dataset.restoreSnap));
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="migrate-loading">读取失败：${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+async function doRestoreSnapshot(snapshotName) {
+  const tgt = state.switchTarget;
+  const home = state.homes.find(h => h.path === tgt);
+  const ok = await confirmDialog({
+    title: '找回对话',
+    message: `从保险快照「${snapshotName}」把「${home ? home.label : tgt}」当前缺失的对话找回来。`,
+    items: [
+      '只会补缺失的对话，不会删除或覆盖现有内容。',
+      '找回的对话会自动登记，重启 DSH 后就能在侧栏看到。',
+      '请确认所有 DSH 窗口已关闭。',
+    ],
+    confirmText: '找回',
+  });
+  if (!ok) return;
+  try {
+    const rep = await withOpProgress('正在找回对话', () => invoke('restore_snapshot_sessions', {
+      repo: state.defaultRepo, targetHome: tgt, snapshotName,
+    }));
+    let msg = `找回完成：恢复 ${rep.restored} 条对话（跳过已存在的 ${rep.skipped} 条）`;
+    if (rep.registered) msg += `，并补登记 ${rep.registered} 条`;
+    msg += '。请重启目标 DSH 查看。';
+    showResult($('recover-result'), msg, false);
+    renderRouteCheck(tgt);
+  } catch (e) {
+    showResult($('recover-result'), `找回失败：${e.message || e}`, true);
+  }
+}
+
+// v7：修复对话登记（磁盘上有、侧栏看不到的对话补登记）
+async function doRepairRegistry() {
+  const tgt = state.switchTarget;
+  if (!tgt) {
+    showResult($('recover-result'), '请先在上方选择「目标环境」。', true);
+    return;
+  }
+  try {
+    const rep = await withOpProgress('正在修复对话登记', () =>
+      invoke('repair_registry', { targetHome: tgt }));
+    let msg = rep.registered > 0
+      ? `修复完成：补登记 ${rep.registered} 条对话（已存在 ${rep.already} 条）。重启 DSH 后即可在侧栏看到。`
+      : '检查完毕：所有对话都已正常登记，无需修复。';
+    showResult($('recover-result'), msg, false);
+    renderRouteCheck(tgt);
+  } catch (e) {
+    showResult($('recover-result'), `修复失败：${e.message || e}`, true);
+  }
+}
+
 // v6：一键补齐目标环境的模型提供方（从源环境搬运提供方定义，不含密钥）。
 async function doFixProviders() {
   const bar = $('provider-fix-bar');
@@ -1761,6 +1856,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (fpBtn) fpBtn.addEventListener('click', doFixPresets);
   const pvBtn = $('fix-providers-btn');
   if (pvBtn) pvBtn.addEventListener('click', doFixProviders);
+  const repBtn = $('repair-registry');
+  if (repBtn) repBtn.addEventListener('click', doRepairRegistry);
   const migLoad = $('migrate-load');
   if (migLoad) migLoad.addEventListener('click', loadMigrateSessions);
   const migExec = $('migrate-execute');

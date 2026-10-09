@@ -358,7 +358,9 @@ async fn switch_links(
     include_config: bool,
     include_memories: bool,
     include_presets: bool,
+    replace_mode: Option<bool>,
 ) -> Result<adopt::SwitchResult, String> {
+    let replace_mode = replace_mode.unwrap_or(false); // 默认合并模式
     let repo_log = repo.clone();
     let route = format!("{} → {}", source_home, target_home);
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -371,6 +373,7 @@ async fn switch_links(
             include_config,
             include_memories,
             include_presets,
+            replace_mode,
         )
     })
     .await
@@ -479,6 +482,45 @@ async fn fix_providers_now(source_home: String, target_home: String) -> Result<p
     })
     .await
     .map_err(|e| format!("提供方补齐任务中断：{e}"))?
+}
+
+#[tauri::command]
+async fn repair_registry(target_home: String) -> Result<migrate::RegistryRepairReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let running = adopt::detect_dsh_processes();
+        if !running.is_empty() {
+            return Err(format!("检测到 DSH 正在运行（{}），请先完全关闭再修复登记。", running.join(", ")));
+        }
+        migrate::repair_session_registry(&PathBuf::from(target_home))
+    })
+    .await
+    .map_err(|e| format!("修复登记任务中断：{e}"))?
+}
+
+#[tauri::command]
+async fn restore_snapshot_sessions(
+    repo: String,
+    target_home: String,
+    snapshot_name: String,
+) -> Result<migrate::SnapshotRestoreReport, String> {
+    let repo_log = repo.clone();
+    let route = format!("{snapshot_name} → {target_home}");
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        migrate::restore_sessions_from_snapshot(
+            &PathBuf::from(repo),
+            &PathBuf::from(target_home),
+            &snapshot_name,
+        )
+    })
+    .await
+    .map_err(|e| format!("找回任务中断：{e}"))?;
+    match &result {
+        Ok(r) => oplog::record("restore_sessions", &repo_log, &route,
+            &format!("找回 {} 条（跳过 {} 条），补登记 {}", r.restored, r.skipped, r.registered), "ok", ""),
+        Err(e) => oplog::record("restore_sessions", &repo_log, &route, "", "fail",
+            &e.chars().take(200).collect::<String>()),
+    }
+    result
 }
 
 #[tauri::command]
@@ -652,6 +694,8 @@ fn main() {
             undo_last,
             list_rollback_ledgers,
             check_routability,
+            repair_registry,
+            restore_snapshot_sessions,
             fix_providers_now,
             list_sessions,
             migrate_sessions,

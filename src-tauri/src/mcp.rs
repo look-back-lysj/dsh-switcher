@@ -162,6 +162,7 @@ fn handle_tools_call(id: Value, params: &Value) -> Value {
                 &PathBuf::from(source),
                 &PathBuf::from(target),
                 inc_sessions, inc_skills, inc_config, inc_mem, inc_presets,
+                false, // 合并模式（MCP 默认安全：不删除目标端内容）
             ) {
                 Ok(r) => result_ok(id, format!(
                     "切换完成：{} 类内容已切换。目标原件已存保险快照「{}」。",

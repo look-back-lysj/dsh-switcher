@@ -568,6 +568,194 @@ pub fn migrate_sessions(
     Ok(result)
 }
 
+/// 合并两份 workspace.json（目标 + 来源）：工作区按 path 对齐，sessionIds 取并集；
+/// 来源独有的工作区整体并入（id 冲突则换新 id）；archivedSessionIds 取并集。
+/// 返回（新增工作区数, 新增会话登记数）。目标文件不存在时直接用来源覆盖。
+pub(crate) fn merge_workspace_json(target_file: &Path, source_file: &Path) -> Result<(usize, usize), String> {
+    if !source_file.is_file() {
+        return Ok((0, 0));
+    }
+    if !target_file.is_file() {
+        if let Some(parent) = target_file.parent() { let _ = fs::create_dir_all(parent); }
+        fs::copy(source_file, target_file).map_err(|e| format!("复制 workspace.json 失败：{e}"))?;
+        return Ok((0, 0));
+    }
+    let mut tgt: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(target_file).map_err(|e| format!("读目标 workspace.json 失败：{e}"))?,
+    ).map_err(|e| format!("目标 workspace.json 不是有效 JSON：{e}"))?;
+    let src: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(source_file).map_err(|e| format!("读来源 workspace.json 失败：{e}"))?,
+    ).map_err(|e| format!("来源 workspace.json 不是有效 JSON：{e}"))?;
+
+    if tgt.get("unit").is_none() { tgt["unit"] = serde_json::json!({"name":"workspace","version":2}); }
+    if tgt.get("global").is_none() { tgt["global"] = serde_json::json!({"initialized":true,"workspaceIds":[],"archivedSessionIds":[]}); }
+    if tgt.get("tables").is_none() { tgt["tables"] = serde_json::json!({"workspaces":{}}); }
+    if tgt["tables"].get("workspaces").is_none() { tgt["tables"]["workspaces"] = serde_json::json!({}); }
+
+    let src_workspaces = src.get("tables").and_then(|x| x.get("workspaces")).and_then(|x| x.as_object()).cloned().unwrap_or_default();
+
+    let mut added_ws = 0usize;
+    let mut added_sessions = 0usize;
+
+    for (_src_id, src_ws) in src_workspaces.iter() {
+        let src_path = src_ws.get("path").and_then(|x| x.as_str()).unwrap_or("");
+        if src_path.is_empty() { continue; }
+        // 找目标端同 path 的工作区
+        let mut found_key: Option<String> = None;
+        if let Some(ws_map) = tgt["tables"]["workspaces"].as_object() {
+            for (k, v) in ws_map.iter() {
+                if v.get("path").and_then(|x| x.as_str()) == Some(src_path) { found_key = Some(k.clone()); break; }
+            }
+        }
+        match found_key {
+            Some(k) => {
+                // 已有工作区：sessionIds 取并集（目标原有的全部保留）
+                let entry = &mut tgt["tables"]["workspaces"][&k];
+                if entry.get("sessionIds").is_none() { entry["sessionIds"] = serde_json::json!([]); }
+                let src_ids: Vec<String> = src_ws.get("sessionIds").and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+                if let Some(arr) = entry["sessionIds"].as_array_mut() {
+                    for id in src_ids {
+                        if !arr.iter().any(|x| x.as_str() == Some(id.as_str())) { arr.push(serde_json::json!(id)); added_sessions += 1; }
+                    }
+                }
+            }
+            None => {
+                // 目标端没有这个工作区：并入（沿用来源 id；若与已有 key 冲突则换新 id）
+                let mut new_id = src_ws.get("id").and_then(|x| x.as_str()).map(String::from)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                if tgt["tables"]["workspaces"].get(&new_id).is_some() { new_id = uuid::Uuid::new_v4().to_string(); }
+                let count = src_ws.get("sessionIds").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
+                let mut entry = src_ws.clone();
+                if let Some(obj) = entry.as_object_mut() { obj.remove("id"); }
+                tgt["tables"]["workspaces"][&new_id] = entry;
+                if let Some(ids) = tgt["global"]["workspaceIds"].as_array_mut() {
+                    if !ids.iter().any(|x| x.as_str() == Some(new_id.as_str())) { ids.push(serde_json::json!(new_id)); }
+                }
+                added_ws += 1;
+                added_sessions += count;
+            }
+        }
+    }
+    // archived 名单取并集
+    let src_archived: Vec<String> = src.pointer("/global/archivedSessionIds").and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    if tgt["global"].get("archivedSessionIds").is_none() { tgt["global"]["archivedSessionIds"] = serde_json::json!([]); }
+    if let Some(arr) = tgt["global"]["archivedSessionIds"].as_array_mut() {
+        for id in src_archived { if !arr.iter().any(|x| x.as_str() == Some(id.as_str())) { arr.push(serde_json::json!(id)); } }
+    }
+
+    // 备份 + 原子写
+    let bak = target_file.with_extension("vault-bak");
+    let _ = fs::copy(target_file, &bak);
+    let text = serde_json::to_string_pretty(&tgt).map_err(|e| format!("序列化失败：{e}"))?;
+    let tmp = target_file.with_extension("vault-tmp");
+    fs::write(&tmp, text).map_err(|e| format!("写 workspace.json 失败：{e}"))?;
+    fs::rename(&tmp, target_file).map_err(|e| format!("改名失败：{e}"))?;
+    Ok((added_ws, added_sessions))
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryRepairReport {
+    pub registered: usize,
+    pub already: usize,
+    pub cache_written: usize,
+    pub notes: Vec<String>,
+}
+
+/// 对话登记修复：把磁盘上存在、但没登记进 workspace.json 的会话补登记
+/// （并补建 projcache），让它们在侧栏可见。修复型操作，只增不删。
+pub fn repair_session_registry(target_home: &Path) -> Result<RegistryRepairReport, String> {
+    let all = list_sessions(target_home);
+    let ws_file = target_home.join("storages").join("workspace.json");
+    let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(text) = fs::read_to_string(&ws_file) {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(map) = doc.pointer("/tables/workspaces").and_then(|x| x.as_object()) {
+                for (_k, w) in map {
+                    if let Some(ids) = w.get("sessionIds").and_then(|x| x.as_array()) {
+                        for i in ids { if let Some(s) = i.as_str() { registered.insert(s.to_string()); } }
+                    }
+                }
+            }
+        }
+    }
+    let mut rep = RegistryRepairReport::default();
+    let mut by_cwd: std::collections::BTreeMap<String, Vec<(String, u64, u32)>> = std::collections::BTreeMap::new();
+    for e in &all {
+        if registered.contains(&e.id) { rep.already += 1; continue; }
+        let Some(cwd) = e.cwd.clone() else { continue };
+        by_cwd.entry(cwd).or_default().push((e.id.clone(), e.created_at_ms, e.generation));
+        rep.registered += 1;
+    }
+    for (cwd, list) in &by_cwd {
+        let ids: Vec<String> = list.iter().map(|x| x.0.clone()).collect();
+        append_to_workspace_index(target_home, cwd, &ids).map_err(|e| format!("登记失败（{cwd}）：{e}"))?;
+        for (id, created, gen) in list {
+            if write_minimal_projection_cache(target_home, id, *created, cwd, *gen).is_ok() {
+                rep.cache_written += 1;
+            }
+        }
+    }
+    if rep.registered > 0 {
+        rep.notes.push(format!("已把 {} 条磁盘上有、但侧栏没登记的对话登记回去了（下次打开 DSH 即可看到）。", rep.registered));
+    } else {
+        rep.notes.push("所有对话都已正常登记，无需修复。".to_string());
+    }
+    Ok(rep)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotRestoreReport {
+    pub restored: usize,
+    pub skipped: usize,
+    pub registered: usize,
+    pub snapshot: String,
+}
+
+/// 从某次切换保险快照里把"目标端当前缺失的对话"找回来（只增不删），并自动登记。
+pub fn restore_sessions_from_snapshot(
+    repo: &Path,
+    target_home: &Path,
+    snapshot_name: &str,
+) -> Result<SnapshotRestoreReport, String> {
+    let running = crate::adopt::detect_dsh_processes();
+    if !running.is_empty() {
+        return Err(format!("检测到 DSH 正在运行（{}），请先完全关闭再找回对话。", running.join(", ")));
+    }
+    let tgt_id = crate::adopt::home_id_of(target_home);
+    let snap_root = repo.join("switch-backups").join(&tgt_id).join(snapshot_name).join("sessions");
+    if !snap_root.is_dir() {
+        return Err(format!("该快照里没有 sessions 目录：{snapshot_name}"));
+    }
+    let current: std::collections::HashSet<String> =
+        list_sessions(target_home).into_iter().map(|e| e.id).collect();
+    let mut report = SnapshotRestoreReport { restored: 0, skipped: 0, registered: 0, snapshot: snapshot_name.to_string() };
+
+    for proj in fs::read_dir(&snap_root).into_iter().flatten().flatten() {
+        let Ok(sessions) = fs::read_dir(proj.path()) else { continue };
+        for s in sessions.flatten() {
+            let dir = s.path();
+            if !dir.is_dir() { continue; }
+            let Some(file) = crate::routecheck::newest_session_file(&dir) else { continue };
+            let entry = parse_session_entry(&dir, &file);
+            if current.contains(&entry.id) { report.skipped += 1; continue; }
+            let Some(cwd) = entry.cwd.clone() else { report.skipped += 1; continue };
+            let dst = target_home.join("sessions").join(project_key(&cwd)).join(&entry.id);
+            if dst.exists() { report.skipped += 1; continue; }
+            crate::adopt::copy_dir_recursive(&dir, &dst).map_err(|e| format!("找回 {} 失败：{e}", entry.id))?;
+            report.restored += 1;
+        }
+    }
+    if report.restored > 0 {
+        let repair = repair_session_registry(target_home)?;
+        report.registered = repair.registered;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
