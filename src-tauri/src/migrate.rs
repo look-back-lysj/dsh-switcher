@@ -66,6 +66,12 @@ pub struct MigrateResult {
     pub errors: Vec<String>,
     /// 迁移后每条的状态（来自 routecheck，前端直接渲染）
     pub details: Vec<MigratedItem>,
+    /// v6：本次为让对话能发消息而补齐到目标端的模型提供方 id
+    #[serde(default)]
+    pub provider_added: Vec<String>,
+    /// v6：还需要在目标版本界面补录的 Key 名（只列名，不列值）
+    #[serde(default)]
+    pub keys_to_enter: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -448,6 +454,8 @@ pub fn migrate_sessions(
         notes: Vec::new(),
         errors: Vec::new(),
         details: Vec::new(),
+        provider_added: Vec::new(),
+        keys_to_enter: Vec::new(),
     };
 
     // 按目标 cwd 分组，最后统一追加 workspace 索引
@@ -522,6 +530,20 @@ pub fn migrate_sessions(
     for (cwd, ids) in &ids_by_cwd {
         if let Err(e) = append_to_workspace_index(target_home, cwd, ids) {
             result.errors.push(format!("工作区索引追加失败（{}）：{}", cwd, e));
+        }
+    }
+
+    // v6 提供方携带：确保目标端有这些会话需要的模型提供方，否则发消息会报 NO_ADAPTER。
+    // 只搬"提供方定义"（api/baseURL/models/apiKeyEnv 引用名），密钥仍由用户录入。
+    let src_defs = crate::providers::collect_provider_defs(source_home);
+    if !src_defs.is_empty() {
+        match crate::providers::ensure_providers(target_home, &src_defs) {
+            Ok(rep) => {
+                result.provider_added = rep.added.clone();
+                result.keys_to_enter = rep.keys_to_enter.clone();
+                for n in rep.notes { result.notes.push(n); }
+            }
+            Err(e) => result.errors.push(format!("提供方配置补齐失败（不影响对话文件）：{e}")),
         }
     }
 

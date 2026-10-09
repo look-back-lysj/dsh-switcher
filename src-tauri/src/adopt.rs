@@ -266,6 +266,10 @@ pub(crate) fn home_id_of(path: &Path) -> String {
 /// 返回运行中的 DSH 进程名列表（空 = 未运行）。
 #[cfg(windows)]
 pub(crate) fn detect_dsh_processes() -> Vec<String> {
+    // 测试隔离：单元测试不应被开发机正在运行的 DSH 拦住（否则测试结果依赖本机状态）。
+    if cfg!(test) {
+        return Vec::new();
+    }
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -816,6 +820,12 @@ pub struct SwitchResult {
     /// v4.3：本次改写了多少条对话的非法预设（anchored-standard → standard）。
     #[serde(default)]
     pub preset_fixed: u32,
+    /// v6：本次为让对话能发消息而补齐到目标端的模型提供方 id
+    #[serde(default)]
+    pub provider_added: Vec<String>,
+    /// v6：还需要在目标版本界面补录的 Key 名（只列名，不列值）
+    #[serde(default)]
+    pub keys_to_enter: Vec<String>,
 }
 
 /// v5 模块三：为保险快照生成 manifest（rel → sha256 + size），回滚校验用。
@@ -1343,6 +1353,24 @@ pub fn switch_links(
         }
     }
 
+    // v6 提供方携带：目标端可能没有源端会话需要的模型提供方（如 xiaomi-token-plan-cn），
+    // 缺失时发消息会报 NO_ADAPTER。这里把源端提供方定义补齐到目标配置（不搬密钥）。
+    let mut provider_added: Vec<String> = Vec::new();
+    let mut keys_to_enter: Vec<String> = Vec::new();
+    if include_sessions || include_config {
+        let defs = crate::providers::collect_provider_defs(source_home);
+        if !defs.is_empty() {
+            match crate::providers::ensure_providers(target_home, &defs) {
+                Ok(rep) => {
+                    provider_added = rep.added.clone();
+                    keys_to_enter = rep.keys_to_enter.clone();
+                    for n in rep.notes { warnings.push(n); }
+                }
+                Err(e) => warnings.push(format!("提供方配置补齐失败（不影响对话文件）：{e}")),
+            }
+        }
+    }
+
     Ok(SwitchResult {
         switched_links: switched,
         backup_snapshot: snap_name,
@@ -1351,6 +1379,8 @@ pub fn switch_links(
         credential_note,
         settings_copied,
         preset_fixed: preset_fixed_count,
+        provider_added,
+        keys_to_enter,
     })
 }
 

@@ -1390,6 +1390,12 @@ async function doSwitch() {
     if (result.settingsCopied) {
       msg += `\n\n模型提供方配置已一并带过去（settings.yaml）。请重启「${t?.label}」，它启动时会自动导入这份配置。`;
     }
+    if (result.providerAdded && result.providerAdded.length) {
+      msg += `\n\n已为目标版本补齐 ${result.providerAdded.length} 个模型提供方配置：${result.providerAdded.join('、')}。`;
+    }
+    if (result.keysToEnter && result.keysToEnter.length) {
+      msg += `\n\n⚠ 还需要在目标版本「设置 → 模型」里录入 API Key：${result.keysToEnter.join('、')}。`;
+    }
     if (result.presetFixed > 0) {
       msg += `\n\n已自动修复 ${result.presetFixed} 条对话的预设（anchored-standard 等改成官方认识的 standard），这些对话现在能正常继续了。`;
     }
@@ -1551,6 +1557,12 @@ async function doMigrate() {
     }));
     let msg = `迁移完成：${result.migrated} 条对话已搬到「${t?.label}」。`;
     if (result.remappedIds > 0) msg += `\n\n${result.remappedIds} 条因 id 冲突自动换了新 id（目标原有对话未被覆盖）。`;
+    if (result.providerAdded && result.providerAdded.length) {
+      msg += `\n\n已为目标版本补齐 ${result.providerAdded.length} 个模型提供方配置：${result.providerAdded.join('、')}。`;
+    }
+    if (result.keysToEnter && result.keysToEnter.length) {
+      msg += `\n\n⚠ 还需要在目标版本「设置 → 模型」里录入 API Key：${result.keysToEnter.join('、')}（安全设计，密钥不随文件迁移）。录一次即可。`;
+    }
     if (result.notes && result.notes.length) msg += `\n\n${result.notes.join('\n')}`;
     if (result.errors && result.errors.length) msg += `\n\n注意：${result.errors.join('；')}`;
     msg += '\n\n请重启目标 DSH 查看这些对话。';
@@ -1561,6 +1573,35 @@ async function doMigrate() {
     backgroundRescan();
   } catch (e) {
     showResult($('migrate-result'), `迁移失败：${e.message || e}`, true);
+  }
+}
+
+// v6：一键补齐目标环境的模型提供方（从源环境搬运提供方定义，不含密钥）。
+async function doFixProviders() {
+  const bar = $('provider-fix-bar');
+  if (!bar || !bar.dataset.target) return;
+  const src = state.switchSource;
+  if (!src) {
+    showResult($('switch-result'), '请先在上方选择「源环境」（提供方配置从这里搬）。', true);
+    return;
+  }
+  try {
+    const report = await withOpProgress('正在补齐模型提供方配置', () =>
+      invoke('fix_providers_now', { sourceHome: src, targetHome: bar.dataset.target }));
+    let msg = '';
+    if (report.added && report.added.length) {
+      msg += `已补齐 ${report.added.length} 个模型提供方：${report.added.join('、')}。`;
+    } else {
+      msg += '目标版本的提供方配置已经完整，无需补齐。';
+    }
+    if (report.keysToEnter && report.keysToEnter.length) {
+      msg += `\n\n⚠ 还需要在目标版本「设置 → 模型」里录入 API Key：${report.keysToEnter.join('、')}。`;
+    }
+    msg += '\n\n请重启目标 DSH 让配置生效。';
+    showResult($('switch-result'), msg, false);
+    renderRouteCheck(bar.dataset.target);
+  } catch (e) {
+    showResult($('switch-result'), `补齐失败：${e.message || e}`, true);
   }
 }
 
@@ -1642,6 +1683,13 @@ async function renderRouteCheck(targetHome) {
     const hasBadPreset = (report.verdicts || []).some(v => v.preset && !knownPresets.includes(v.preset));
     const pfb = $('preset-fix-bar');
     if (pfb) { pfb.hidden = !hasBadPreset; pfb.dataset.target = targetHome; }
+    // v6：体检发现"缺提供方"时，显示自动补齐按钮（用当前源/目标环境）
+    const provBar = $('provider-fix-bar');
+    if (provBar) {
+      const needsProvider = (report.needModel || 0) > 0;
+      provBar.hidden = !needsProvider;
+      provBar.dataset.target = targetHome;
+    }
 
     const list = $('routecheck-list');
     list.innerHTML = '';
@@ -1711,6 +1759,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (rbBtn) rbBtn.addEventListener('click', doRollbackSwitch);
   const fpBtn = $('fix-presets-btn');
   if (fpBtn) fpBtn.addEventListener('click', doFixPresets);
+  const pvBtn = $('fix-providers-btn');
+  if (pvBtn) pvBtn.addEventListener('click', doFixProviders);
   const migLoad = $('migrate-load');
   if (migLoad) migLoad.addEventListener('click', loadMigrateSessions);
   const migExec = $('migrate-execute');

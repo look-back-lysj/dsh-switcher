@@ -9,6 +9,7 @@ mod oplog;
 mod multiscan;
 mod repo;
 mod preset_fix;
+mod providers;
 mod project_key;
 mod routecheck;
 mod scan_cache;
@@ -466,6 +467,21 @@ async fn migrate_sessions(
 }
 
 #[tauri::command]
+async fn fix_providers_now(source_home: String, target_home: String) -> Result<providers::ProviderMergeReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // 改配置前必须关闭 DSH：否则应用回写可能覆盖我们插入的提供方配置
+        let running = adopt::detect_dsh_processes();
+        if !running.is_empty() {
+            return Err(format!("检测到 DSH 正在运行（{}），请先完全关闭再补齐提供方配置。", running.join(", ")));
+        }
+        let defs = providers::collect_provider_defs(&PathBuf::from(&source_home));
+        providers::ensure_providers(&PathBuf::from(&target_home), &defs)
+    })
+    .await
+    .map_err(|e| format!("提供方补齐任务中断：{e}"))?
+}
+
+#[tauri::command]
 fn check_routability(target_home: String) -> Result<routecheck::RouteCheckReport, String> {
     Ok(routecheck::check_routability(&PathBuf::from(target_home)))
 }
@@ -636,6 +652,7 @@ fn main() {
             undo_last,
             list_rollback_ledgers,
             check_routability,
+            fix_providers_now,
             list_sessions,
             migrate_sessions,
             fix_presets_now,

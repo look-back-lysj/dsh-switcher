@@ -288,6 +288,10 @@
               <button class="button compact primary" id="fix-presets-btn" type="button">一键修复预设问题</button>
               <span class="preset-fix-hint">把 anchored-standard 等改成官方认识的 standard，对话即可正常继续</span>
             </div>
+            <div class="preset-fix-bar" id="provider-fix-bar" hidden>
+              <button class="button compact primary" id="fix-providers-btn" type="button">自动补齐模型提供方</button>
+              <span class="preset-fix-hint">把源环境的模型提供方配置搬到目标环境（只搬配置，不搬密钥），解决“发消息报 NO_ADAPTER”</span>
+            </div>
             <details class="routecheck-detail">
               <summary>查看每条对话的体检明细</summary>
               <div class="routecheck-list" id="routecheck-list"></div>

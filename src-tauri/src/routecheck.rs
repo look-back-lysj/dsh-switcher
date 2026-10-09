@@ -26,6 +26,9 @@ pub struct SessionVerdict {
     /// v4.3：会话 header 里的 agentPreset（供前端检测非法预设）
     #[serde(default)]
     pub preset: Option<String>,
+    /// v6：need_credential 时，指出缺哪个 Key（只列名）
+    #[serde(default)]
+    pub credential_env: Option<String>,
     /// ok / need_model / need_credential / archived / cwd_missing / attachment_missing
     pub status: String,
     pub notes: Vec<String>,
@@ -131,10 +134,11 @@ pub fn collect_credential_refs(target_home: &Path) -> Vec<String> {
                 in_refs = false;
                 continue;
             }
-            // "- DEEPSEEK_API_KEY" 或 "DEEPSEEK_API_KEY:" 两种形态都兜
-            let item = key.trim_start_matches('-').trim().trim_end_matches(':');
-            if !item.is_empty() && item.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
-                out.insert(item.to_string());
+            // 条目形态三种都兜：`- NAME`、`NAME:`、`NAME: <value>`（只取名称，绝不读值）
+            let name = key.trim_start_matches('-').trim();
+            let name = name.split(':').next().unwrap_or("").trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+                out.insert(name.to_string());
             }
         }
     }
@@ -255,6 +259,8 @@ pub(crate) fn archived_ids(target_home: &Path) -> HashSet<String> {
 pub fn check_routability(target_home: &Path) -> RouteCheckReport {
     let providers = collect_providers(target_home);
     let cred_refs = collect_credential_refs(target_home);
+    // v6：提供方定义（含 apiKeyEnv 引用名），用于判断"提供方已配置但 Key 未录入"
+    let provider_defs = crate::providers::collect_provider_defs(target_home);
     let archived = archived_ids(target_home);
     let has_attachments_dir = target_home.join("attachments").is_dir();
 
@@ -273,6 +279,7 @@ pub fn check_routability(target_home: &Path) -> RouteCheckReport {
                     cwd: None,
                     route: None,
                     preset: None,
+                    credential_env: None,
                     status: "ok".into(),
                     notes: Vec::new(),
                 };
@@ -301,7 +308,21 @@ pub fn check_routability(target_home: &Path) -> RouteCheckReport {
                             let is_builtin = provider.starts_with("deepseek") || provider == "deepseek-account" || provider == "deepseek-official";
                             if !is_builtin && !providers.iter().any(|p| p == provider) {
                                 v.status = "need_model".into();
-                                v.notes.push(format!("提供方 {provider} 在目标端未配置"));
+                                v.notes.push(format!("提供方 {provider} 在目标端未配置（发消息会报 NO_ADAPTER）"));
+                            } else if !is_builtin {
+                                // v6：提供方已配置，检查它需要的 API Key 是否已在目标端录入（只比对名字）
+                                if let Some(def) = provider_defs.get(provider) {
+                                    if let Some(env) = &def.api_key_env {
+                                        if !cred_refs.iter().any(|c| c == env) {
+                                            v.status = "need_credential".into();
+                                            v.credential_env = Some(env.clone());
+                                            v.notes.push(format!(
+                                                "需要在此版本「设置 → 模型」里录入 {}；或在这条对话里点模型位换成已可用的模型（二选一即可）",
+                                                env
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                         }
                         // 4. 附件
@@ -342,6 +363,7 @@ pub fn check_routability(target_home: &Path) -> RouteCheckReport {
 fn build_todo(verdicts: &[SessionVerdict]) -> Vec<String> {
     let mut lines = Vec::new();
     let need_model: Vec<&SessionVerdict> = verdicts.iter().filter(|v| v.status == "need_model").collect();
+    let need_cred: Vec<&SessionVerdict> = verdicts.iter().filter(|v| v.status == "need_credential").collect();
     let archived: Vec<&SessionVerdict> = verdicts.iter().filter(|v| v.status == "archived").collect();
     let att: Vec<&SessionVerdict> = verdicts.iter().filter(|v| !v.notes.is_empty() && v.notes.iter().any(|n| n.contains("附件"))).collect();
     if !need_model.is_empty() {
@@ -350,6 +372,19 @@ fn build_todo(verdicts: &[SessionVerdict]) -> Vec<String> {
             "{} 条对话用的是目标端没有的模型提供方（{}）。两种救法（任选）：① 打开对话 → 点输入框旁的模型名 → 换成可用模型（每条一次，最快）；② 在目标版本的设置里添加同名提供方并重新粘贴 API Key。",
             need_model.len(),
             providers.into_iter().collect::<Vec<_>>().join("、")
+        ));
+    }
+    if !need_cred.is_empty() {
+        let mut envs: Vec<String> = Vec::new();
+        for v in &need_cred {
+            if let Some(env) = &v.credential_env {
+                if !envs.contains(env) { envs.push(env.clone()); }
+            }
+        }
+        lines.push(format!(
+            "{} 条对话的模型提供方已配置，只差 API Key：在目标版本「设置 → 模型」里录入 {} 即可（或在对话里点模型位换成已可用的模型）。",
+            need_cred.len(),
+            if envs.is_empty() { "对应 Key".to_string() } else { envs.join("、") }
         ));
     }
     if !archived.is_empty() {
@@ -387,6 +422,20 @@ mod tests {
         let refs = collect_credential_refs(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(refs, vec!["DEEPSEEK_API_KEY", "QIU005_API_KEY"]);
+    }
+
+    #[test]
+    fn credential_refs_supports_name_value_format() {
+        // 真实格式：refs 下是 `NAME: <value>`（我们只取名称，绝不读值）
+        let yaml = "version: 1\nrefs:\n  ALIY_API_KEY: sk-demo\n  QIU_API_KEY: sk-demo2\nrecords:\n  - name: x\n";
+        let dir = std::env::temp_dir().join(format!("dsh-vault-rt2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".credentials.yaml"), yaml).unwrap();
+        let refs = collect_credential_refs(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(refs.contains(&"ALIY_API_KEY".to_string()), "应识别 NAME: value 形态: {:?}", refs);
+        assert!(refs.contains(&"QIU_API_KEY".to_string()));
+        assert!(!refs.iter().any(|r| r.contains("sk-")), "绝不能把值当名称读出: {:?}", refs);
     }
 
     #[test]
