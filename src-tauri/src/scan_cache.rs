@@ -33,7 +33,22 @@ fn cache_path() -> PathBuf {
     // 测试隔离：单元测试用进程专属临时目录，绝不写真实 %APPDATA% 缓存（防污染用户界面）。
     // 之前测试直接写真缓存，导致 C:\m5-* 测试环境残留出现在用户扫描结果里。
     if cfg!(test) {
-        return std::env::temp_dir().join(format!("dsh-vault-scan-cache-test-{}", std::process::id()));
+        // 并发隔离：每个测试线程一个稳定且唯一的目录。
+        // thread_local 保证同一线程内 save/load 用同一目录（路径稳定），
+        // 不同测试线程用不同目录（不互相覆盖），根治间歇性并发失败。
+        use std::cell::RefCell;
+        thread_local! {
+            static TEST_DIR: RefCell<Option<PathBuf>> = RefCell::new(None);
+        }
+        return TEST_DIR.with(|d| {
+            let mut d = d.borrow_mut();
+            if d.is_none() {
+                static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *d = Some(std::env::temp_dir().join(format!("dsh-vault-scan-cache-test-{}-{}", std::process::id(), n)));
+            }
+            d.clone().unwrap()
+        });
     }
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)

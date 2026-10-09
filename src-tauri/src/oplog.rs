@@ -42,6 +42,22 @@ pub struct OpEntry {
 }
 
 fn log_dir() -> PathBuf {
+    // 测试隔离：单元测试用独立临时目录，绝不写真实应用日志（防测试记录混入用户日志、防并发互踩）。
+    if cfg!(test) {
+        use std::cell::RefCell;
+        thread_local! {
+            static TEST_DIR: RefCell<Option<PathBuf>> = RefCell::new(None);
+        }
+        return TEST_DIR.with(|d| {
+            let mut d = d.borrow_mut();
+            if d.is_none() {
+                static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *d = Some(std::env::temp_dir().join(format!("dsh-vault-oplog-test-{}-{}", std::process::id(), n)));
+            }
+            d.clone().unwrap()
+        });
+    }
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
